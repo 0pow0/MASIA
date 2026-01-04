@@ -1,1 +1,5 @@
 results/
+3rdparty/
+__MACOSX/
+**/__pycache__/
+.vscode/

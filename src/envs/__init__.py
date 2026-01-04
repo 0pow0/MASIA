@@ -19,10 +19,12 @@ REGISTRY = {}
 
 from gym.spaces import flatdim
 from .traffic_junction import Traffic_JunctionEnv
+from .predator_prey import PredatorPreyEnv
 REGISTRY["traffic_junction"] = partial(env_fn, env=Traffic_JunctionEnv)
 REGISTRY["sc2"] = partial(env_fn, env=StarCraft2Env)
 REGISTRY["hallway"] = partial(env_fn, env=Join1Env)
 REGISTRY["hallway_group"] = partial(env_fn, env=JoinNEnv)
+REGISTRY["pp"] = partial(env_fn, env=PredatorPreyEnv)
 
 if sys.platform == "linux":
     os.environ.setdefault(

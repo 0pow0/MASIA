@@ -1,0 +1,21 @@
+env: pp
+
+env_args:
+  map_name: pp_4v1_coop
+  n_predators: 4
+  n_preys: 1
+  dim: 10
+  vision: 2
+  moving_prey: False
+  mode: 'cooperative'  # cooperative | competitive | mixed
+  no_stay: False
+  timestep_penalty: -0.05
+  prey_reward: 0.05  # IC3Net default (POS_PREY_REWARD)
+  episode_limit: 50
+
+learner_log_interval: 10000
+log_interval: 10000
+runner_log_interval: 10000
+t_max: 2050000
+test_interval: 10000
+test_nepisode: 40
