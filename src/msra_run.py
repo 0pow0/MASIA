@@ -97,6 +97,23 @@ def msra_run(_run, _config, _log):
         group_str = "x".join([str(group_id) for group_id in group_ids])
         _config["env_args"]["key"] = f"hallway-{state_str}-{group_str}-{nagents}p"
 
+    if _config["env"] == "pp":
+        n_predators = _config["env_args"]["n_predators"]
+        n_preys = _config["env_args"]["n_preys"]
+        dim = _config["env_args"]["dim"]
+        vision = _config["env_args"]["vision"]
+        mode = _config["env_args"]["mode"]
+        moving_prey = "-moving" if _config["env_args"]["moving_prey"] else ""
+        _config["env_args"]["map_name"] = "pp-{}x{}-{}pred-{}prey-v{}-{}{}".format(
+            str(dim),
+            str(dim),
+            str(n_predators),
+            str(n_preys),
+            str(vision),
+            mode,
+            moving_prey,
+        )
+
     try:
         map_name = _config["env_args"]["map_name"]
     except:
@@ -126,8 +143,15 @@ def msra_run(_run, _config, _log):
     # sacred is on by default
     logger.setup_sacred(_run)
 
+    # setup wandb if enabled
+    if args.use_wandb:
+        logger.setup_wandb(args)
+
     # Run and train
     run_sequential(args=args, logger=logger)
+
+    # Finish wandb run
+    logger.finish()
 
     # Clean up after finishing
     print("Exiting Main")

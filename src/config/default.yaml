@@ -18,6 +18,10 @@ buffer_cpu_only: True # If true we won't keep all of the replay buffer in vram
 
 # --- Logging options ---
 use_tensorboard: True # Log results to tensorboard
+use_wandb: False # Log results to wandb
+wandb_project: "MASIA" # Wandb project name
+wandb_entity: null # Wandb entity (team/user), null uses default
+wandb_run_name: null # Wandb run name, null uses wandb auto-generated name
 save_model: True # Save the models to disk
 save_model_interval: 500000 # Save models after this many timesteps
 checkpoint_path: "" # Load a checkpoint from this path

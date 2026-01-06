@@ -1,7 +1,6 @@
 env: pp
 
 env_args:
-  map_name: pp_4v1_coop
   n_predators: 4
   n_preys: 1
   dim: 10

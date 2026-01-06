@@ -3,3 +3,4 @@ results/
 __MACOSX/
 **/__pycache__/
 .vscode/
+jobs/

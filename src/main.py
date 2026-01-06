@@ -97,8 +97,12 @@ if __name__ == '__main__':
 
     try:
         map_name = config_dict["env_args"]["map_name"]
-    except:
-        map_name = config_dict["env_args"]["key"]    
+    except KeyError:
+        try:
+            map_name = config_dict["env_args"]["key"]
+        except KeyError:
+            # Use environment name as fallback if neither map_name nor key exists
+            map_name = config_dict.get("env", "default")    
     
     # get config from argv, such as "remark"
     def _get_argv_config(params):
