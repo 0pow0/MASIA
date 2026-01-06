@@ -112,7 +112,21 @@ class MASIAAgent(nn.Module):
             repeated_z = z
         else:
             repeated_z = z.unsqueeze(1).repeat(1, self.args.n_agents, 1).reshape(bs*self.args.n_agents, -1) # [bs*n_agents, state_repre_dim]
-        weighted_z = weighted * repeated_z 
+        weighted_z = weighted * repeated_z
+
+        # Phase 1: Apply per-agent message dropout during training
+        if self.training and hasattr(self.args, 'message_dropout_rate') and self.args.message_dropout_rate > 0:
+            # Dropout entire messages from random agents (each agent's message is state_repre_dim)
+            # dropout_mask: [bs, n_agents] - binary mask for which sending agents to keep
+            dropout_mask = (th.rand(bs, self.args.n_agents) > self.args.message_dropout_rate).float()
+            # Broadcast to all receiving agents: [bs, n_agents, n_agents] (receiver, sender)
+            dropout_mask = dropout_mask.unsqueeze(1).repeat(1, self.args.n_agents, 1)
+            # Flatten: [bs*n_agents, n_agents]
+            dropout_mask = dropout_mask.reshape(bs * self.args.n_agents, self.args.n_agents)
+            # Expand to cover state_repre_dim dimensions: [bs*n_agents, n_agents*state_repre_dim]
+            dropout_mask = dropout_mask.repeat_interleave(self.args.state_repre_dim, dim=1)
+            # Apply dropout
+            weighted_z = weighted_z * dropout_mask.to(weighted_z.device)
 
         ob_embed = self.ob_fc(raw_inputs)   # [bs*n_agents, ob_embed_dim]
 
@@ -166,7 +180,16 @@ class MASIAAgent(nn.Module):
         # through gate
         weighted = F.sigmoid(self.gate(inputs)) # [bs*n_agents, state_repre_dim]
         repeated_z = state_repr.unsqueeze(1).repeat(1, self.args.n_agents, 1).reshape(bs*self.args.n_agents, -1) # [bs*n_agents, state_repre_dim]
-        weighted_z = weighted * repeated_z 
+        weighted_z = weighted * repeated_z
+
+        # Phase 1: Apply per-agent message dropout during training
+        if self.training and hasattr(self.args, 'message_dropout_rate') and self.args.message_dropout_rate > 0:
+            # Dropout entire messages from random agents (each agent's message is state_repre_dim)
+            dropout_mask = (th.rand(bs, self.args.n_agents) > self.args.message_dropout_rate).float()
+            dropout_mask = dropout_mask.unsqueeze(1).repeat(1, self.args.n_agents, 1)
+            dropout_mask = dropout_mask.reshape(bs * self.args.n_agents, self.args.n_agents)
+            dropout_mask = dropout_mask.repeat_interleave(self.args.state_repre_dim, dim=1)
+            weighted_z = weighted_z * dropout_mask.to(weighted_z.device)
 
         ob_embed = self.ob_fc(raw_inputs)   # [bs*n_agents, ob_embed_dim]
 

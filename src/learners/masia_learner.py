@@ -46,6 +46,11 @@ class MASIALearner:
         self.last_target_update_step = 0
         self.log_stats_t = -self.args.learner_log_interval - 1
 
+        # Three-phase training tracking
+        self.current_phase = getattr(args, 'training_phase', 1)
+        self.phase_start_step = 0
+        self.q_base_saved = False
+
         device = "cuda" if args.use_cuda else "cpu"
         if self.args.standardise_returns:
             self.ret_ms = RunningMeanStd(shape=(self.n_agents,), device=device)
@@ -240,13 +245,88 @@ class MASIALearner:
             self.logger.log_stat("td_error_abs", (masked_td_error.abs().sum().item()/mask_elems), t_env)
             self.logger.log_stat("q_taken_mean", (chosen_action_qvals * mask).sum().item()/(mask_elems * self.args.n_agents), t_env)
             self.logger.log_stat("target_mean", (targets * mask).sum().item()/(mask_elems * self.args.n_agents), t_env)
+
+            # Three-phase training logging
+            self.logger.log_stat("training_phase", self.current_phase, t_env)
+            self.logger.log_stat("phase_steps", self.training_steps - self.phase_start_step, t_env)
+            if hasattr(self.args, 'message_dropout_rate'):
+                self.logger.log_stat("message_dropout_rate", self.args.message_dropout_rate, t_env)
+
             self.log_stats_t = t_env
 
     def train(self, batch: EpisodeBatch, t_env: int, episode_num: int):
+        # Check for phase transitions (automatic three-phase training)
+        self._check_phase_transition(t_env)
+
         # Representation learning training
         repr_loss = self.repr_train(batch, t_env, episode_num)
         # RL training
         self.rl_train(batch, t_env, episode_num, repr_loss)
+
+    def _check_phase_transition(self, t_env):
+        """Check if we should transition to the next phase based on training steps."""
+        steps_in_phase = self.training_steps - self.phase_start_step
+
+        # Phase 1 -> Phase 2 transition
+        if self.current_phase == 1 and steps_in_phase >= getattr(self.args, 'phase1_steps', float('inf')):
+            self._transition_to_phase2(t_env)
+
+        # Phase 2 -> Phase 3 transition
+        elif self.current_phase == 2 and steps_in_phase >= getattr(self.args, 'phase2_steps', float('inf')):
+            self._transition_to_phase3(t_env)
+
+    def _transition_to_phase2(self, t_env):
+        """Transition from Phase 1 (Robust Pre-training) to Phase 2 (Context-Aware MVE)."""
+        self.logger.console_logger.info(f"\n{'='*60}")
+        self.logger.console_logger.info(f"PHASE TRANSITION: Phase 1 -> Phase 2 at step {self.training_steps}")
+        self.logger.console_logger.info(f"{'='*60}\n")
+
+        # Save Q_base (frozen Q-network for Phase 2 use)
+        if getattr(self.args, 'save_phase1_qbase', True):
+            self._save_q_base()
+
+        # Update phase tracking
+        self.current_phase = 2
+        self.phase_start_step = self.training_steps
+
+        # Disable message dropout for Phase 2
+        self.args.message_dropout_rate = 0.0
+
+        # Log transition
+        self.logger.log_stat("training_phase", self.current_phase, t_env)
+
+    def _transition_to_phase3(self, t_env):
+        """Transition from Phase 2 (Context-Aware MVE) to Phase 3 (Value-Conditional Unlearning)."""
+        self.logger.console_logger.info(f"\n{'='*60}")
+        self.logger.console_logger.info(f"PHASE TRANSITION: Phase 2 -> Phase 3 at step {self.training_steps}")
+        self.logger.console_logger.info(f"{'='*60}\n")
+
+        # Update phase tracking
+        self.current_phase = 3
+        self.phase_start_step = self.training_steps
+
+        # Log transition
+        self.logger.log_stat("training_phase", self.current_phase, t_env)
+
+    def _save_q_base(self):
+        """Save frozen Q-network (Q_base) at the end of Phase 1 for use in Phase 2."""
+        # Create directory for Q_base
+        save_path = getattr(self.args, 'local_results_path', './results')
+        q_base_path = os.path.join(save_path, "phase1_qbase")
+        os.makedirs(q_base_path, exist_ok=True)
+
+        # Save agent (contains Q-network: gate, fc1, rnn, fc2) and encoder
+        th.save(self.mac.agent.state_dict(), f"{q_base_path}/agent.th")
+
+        # Save mixer
+        if self.mixer is not None:
+            th.save(self.mixer.state_dict(), f"{q_base_path}/mixer.th")
+
+        # Save optimizer state for potential resumption
+        th.save(self.optimiser.state_dict(), f"{q_base_path}/opt.th")
+
+        self.logger.console_logger.info(f"Saved Q_base to: {q_base_path}")
+        self.q_base_saved = True
 
     def test_encoder(self, batch: EpisodeBatch):
         # states.shape: [batch_size, seq_len, state_dim]

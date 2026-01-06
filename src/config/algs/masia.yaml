@@ -80,4 +80,27 @@ name: "masia"
 
 # config for robust communication
 noise_env: False
-noise_type: 0 
+noise_type: 0
+
+# ====== Three-Phase Training Configuration ======
+
+# Phase control
+training_phase: 1  # 1: Robust Pre-training, 2: Context-Aware MVE, 3: Value-Conditional Unlearning
+phase1_steps: 50000  # K_pretrain: steps for Phase 1
+phase2_steps: 30000  # K_mve: steps for Phase 2
+phase3_steps: 100000  # M_unlearn: steps for Phase 3
+
+# Phase 1: Robust Pre-training with Message Dropout
+message_dropout_rate: 0.3  # p_drop: probability of dropping each agent's message
+save_phase1_qbase: True  # Save frozen Q_base at end of Phase 1
+
+# Phase 2: Context-Aware Value Estimation (Transformer-based MVE)
+mve_hidden_dim: 64  # Hidden dimension for Transformer encoder
+mve_num_heads: 4  # Number of attention heads
+mve_num_layers: 2  # Number of Transformer encoder layers
+mve_lr: 0.0005  # Learning rate for V_phi
+
+# Phase 3: Value-Conditional Unlearning
+sparsity_lambda: 1.0  # Lambda: threshold multiplier for value-based pruning
+anchor_beta: 0.1  # Beta: weight for anchoring loss (keep high-value behavior stable)
+mve_ema_tau: 0.01  # Tau: momentum for moving average of MVE values (mu_mve) 
