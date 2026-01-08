@@ -8,6 +8,8 @@ class MASIAMAC:
     def __init__(self, scheme, groups, args):
         self.n_agents = args.n_agents
         self.args = args
+        self.scheme = scheme
+        self.groups = groups
         input_shape = self._get_input_shape(scheme)
         self._build_agents(input_shape)
         self.agent_output_type = args.agent_output_type
@@ -120,6 +122,14 @@ class MASIAMAC:
 
     def load_state(self, other_mac):
         self.agent.load_state_dict(other_mac.agent.state_dict())
+
+    def state_dict(self):
+        """Return state dict of the underlying agent."""
+        return self.agent.state_dict()
+
+    def load_state_dict(self, state_dict):
+        """Load state dict into the underlying agent."""
+        self.agent.load_state_dict(state_dict)
 
     def cuda(self):
         self.agent.cuda()

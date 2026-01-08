@@ -317,7 +317,7 @@ class MASIALearner:
 
             # Mix to get joint Q-value
             if self.frozen_mixer is not None:
-                q_context = self.frozen_mixer(chosen_qvals_context, batch["state"][:, :-1])
+                q_context = self.frozen_mixer(chosen_qvals_context, batch["state"][:, :-1]).squeeze(-1)
             else:
                 q_context = chosen_qvals_context.sum(dim=2)
 
@@ -344,7 +344,7 @@ class MASIALearner:
 
                 # Mix
                 if self.frozen_mixer is not None:
-                    q_neg_i = self.frozen_mixer(chosen_qvals_neg_i, batch["state"][:, :-1])
+                    q_neg_i = self.frozen_mixer(chosen_qvals_neg_i, batch["state"][:, :-1]).squeeze(-1)
                 else:
                     q_neg_i = chosen_qvals_neg_i.sum(dim=2)
 
@@ -387,6 +387,8 @@ class MASIALearner:
                     if agent_mask.sum() > 0:
                         avg_value_i = labels_train[agent_mask, i].mean()
                         self.logger.log_stat(f"mve_value_agent_{i}", avg_value_i.item(), t_env)
+
+            self.log_stats_t = t_env
 
     def train(self, batch: EpisodeBatch, t_env: int, episode_num: int):
         # Check for phase transitions (automatic three-phase training)
@@ -438,14 +440,30 @@ class MASIALearner:
             self._save_q_base()
 
         # Create frozen copies of MAC and mixer for MVE training
-        # Use target networks as templates (they were successfully deep copied during init)
-        # Then load current weights to avoid deepcopy issues with computation graphs
-        self.frozen_mac = copy.deepcopy(self.target_mac)
-        self.frozen_mac.load_state_dict(self.mac.state_dict())
+        # Avoid deepcopy issues with non-leaf tensors by manually creating new instances
+        # Safe copy approach: create new MAC and load state_dict
+        # First, get a clean state dict with all tensors detached
+        mac_state = {k: v.clone().detach() for k, v in self.mac.state_dict().items()}
+
+        # Create new MAC instance (same class as self.mac)
+        self.frozen_mac = type(self.mac)(self.mac.scheme, self.mac.groups, self.mac.args)
+        self.frozen_mac.load_state_dict(mac_state)
+        # Move frozen_mac to correct device
+        if self.args.use_cuda:
+            self.frozen_mac.cuda()
 
         if self.mixer is not None:
-            self.frozen_mixer = copy.deepcopy(self.target_mixer)
-            self.frozen_mixer.load_state_dict(self.mixer.state_dict())
+            # Same approach for mixer
+            mixer_state = {k: v.clone().detach() for k, v in self.mixer.state_dict().items()}
+            # VDNMixer takes no args, QMixer takes args
+            if self.args.mixer == "vdn":
+                self.frozen_mixer = type(self.mixer)()
+            else:  # qmix or others
+                self.frozen_mixer = type(self.mixer)(self.args)
+            self.frozen_mixer.load_state_dict(mixer_state)
+            # Move frozen_mixer to correct device
+            if self.args.use_cuda:
+                self.frozen_mixer.cuda()
 
         # Freeze parameters (no gradients)
         for param in self.frozen_mac.parameters():
@@ -474,7 +492,7 @@ class MASIALearner:
         mve_lr = getattr(self.args, 'mve_lr', 0.0005)
         self.mve_optimiser = Adam(params=self.mve.parameters(), lr=mve_lr)
 
-        self.logger.console_logger.info(f"Initialized MVE with message_dim={message_dim}, hidden_dim={self.args.mve_hidden_dim}")
+        self.logger.console_logger.info(f"Initialized MVE with message_dim={message_dim}, hidden_dim={getattr(self.args, 'mve_hidden_dim', 64)}")
         self.logger.console_logger.info(f"MVE optimizer lr={mve_lr}")
 
         # Update phase tracking
