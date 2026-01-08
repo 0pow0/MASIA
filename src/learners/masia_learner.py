@@ -2,6 +2,7 @@ import copy
 from components.episode_buffer import EpisodeBatch
 from modules.mixers.vdn import VDNMixer
 from modules.mixers.qmix import QMixer
+from modules.mve import REGISTRY as mve_REGISTRY
 import torch as th
 import torch.nn.functional as F
 from torch.optim import Adam
@@ -49,7 +50,14 @@ class MASIALearner:
         # Three-phase training tracking
         self.current_phase = getattr(args, 'training_phase', 1)
         self.phase_start_step = 0
+        self.phase_start_t_env = 0  # Track t_env at phase start
         self.q_base_saved = False
+
+        # Phase 2: Message Value Estimator (MVE)
+        self.mve = None
+        self.mve_optimiser = None
+        self.frozen_mac = None  # Frozen Q_base for MVE training
+        self.frozen_mixer = None
 
         device = "cuda" if args.use_cuda else "cpu"
         if self.args.standardise_returns:
@@ -248,46 +256,231 @@ class MASIALearner:
 
             # Three-phase training logging
             self.logger.log_stat("training_phase", self.current_phase, t_env)
+            self.logger.log_stat("phase_t_env", t_env - self.phase_start_t_env, t_env)
             self.logger.log_stat("phase_steps", self.training_steps - self.phase_start_step, t_env)
             if hasattr(self.args, 'message_dropout_rate'):
                 self.logger.log_stat("message_dropout_rate", self.args.message_dropout_rate, t_env)
 
             self.log_stats_t = t_env
 
+    def mve_train(self, batch: EpisodeBatch, t_env: int, episode_num: int):
+        """
+        Phase 2: Train Context-Aware Message Value Estimator (MVE).
+
+        For each agent i, compute:
+            y_i = Q_context - Q_neg_i
+
+        where:
+            Q_context = Q_base(s, u, m)  # All agents' messages present
+            Q_neg_i = Q_base(s, u, m_{-i})  # Agent i silenced BEFORE obs_embed→encoder
+
+        Then train MVE to predict these values: v_hat = V_phi(messages)
+
+        Note: Messages are the embedded observations (output of obs_embed), not encoded states.
+        """
+        if self.mve is None or self.frozen_mac is None:
+            # MVE not initialized yet
+            return
+
+        # Get relevant data from batch
+        actions = batch["actions"][:, :-1]
+        terminated = batch["terminated"][:, :-1].float()
+        mask = batch["filled"][:, :-1].float()
+        mask[:, 1:] = mask[:, 1:] * (1 - terminated[:, :-1])
+
+        bs = batch.batch_size
+        max_seq_length = batch.max_seq_length
+        n_agents = self.args.n_agents
+
+        # Step 1: Extract messages (embedded observations) from all agents
+        messages_list = []
+        for t in range(max_seq_length - 1):
+            messages_t = self.frozen_mac.get_messages(batch, t=t, silence_mask=None)
+            messages_list.append(messages_t)
+
+        # Stack over time: [bs, seq_len-1, n_agents, input_shape]
+        messages = th.stack(messages_list, dim=1)
+        message_dim = messages.shape[-1]
+
+        # Step 2: Compute Q_context (Q-values with all agents communicating)
+        with th.no_grad():
+            mac_out_context = []
+            self.frozen_mac.init_hidden(bs)
+            for t in range(max_seq_length - 1):
+                # Full forward pass (no silencing)
+                state_repr_t = self.frozen_mac.enc_forward(batch, t=t, silence_mask=None)
+                agent_outs = self.frozen_mac.rl_forward(batch, state_repr_t, t=t)
+                mac_out_context.append(agent_outs)
+
+            mac_out_context = th.stack(mac_out_context, dim=1)  # [bs, seq_len-1, n_agents, n_actions]
+            chosen_qvals_context = th.gather(mac_out_context, dim=3, index=actions).squeeze(3)  # [bs, seq_len-1, n_agents]
+
+            # Mix to get joint Q-value
+            if self.frozen_mixer is not None:
+                q_context = self.frozen_mixer(chosen_qvals_context, batch["state"][:, :-1])
+            else:
+                q_context = chosen_qvals_context.sum(dim=2)
+
+        # Step 3: For each agent i, compute Q_neg_i (agent i silenced BEFORE obs_embed→encoder)
+        labels = th.zeros(bs, max_seq_length - 1, n_agents, device=messages.device)
+
+        for i in range(n_agents):
+            with th.no_grad():
+                # Create silence mask: [bs, n_agents] where 1=silence, 0=keep
+                silence_mask = th.zeros(bs, n_agents, device=messages.device)
+                silence_mask[:, i] = 1.0  # Silence agent i
+
+                # Forward pass with agent i silenced
+                mac_out_neg_i = []
+                self.frozen_mac.init_hidden(bs)
+                for t in range(max_seq_length - 1):
+                    # Encode with agent i silenced (happens in obs_embed → encoder)
+                    state_repr_t = self.frozen_mac.enc_forward(batch, t=t, silence_mask=silence_mask)
+                    agent_outs = self.frozen_mac.rl_forward(batch, state_repr_t, t=t)
+                    mac_out_neg_i.append(agent_outs)
+
+                mac_out_neg_i = th.stack(mac_out_neg_i, dim=1)
+                chosen_qvals_neg_i = th.gather(mac_out_neg_i, dim=3, index=actions).squeeze(3)
+
+                # Mix
+                if self.frozen_mixer is not None:
+                    q_neg_i = self.frozen_mixer(chosen_qvals_neg_i, batch["state"][:, :-1])
+                else:
+                    q_neg_i = chosen_qvals_neg_i.sum(dim=2)
+
+                # Label: y_i = Q_context - Q_neg_i (NO ReLU)
+                # Positive = helpful message, Negative = harmful message
+                labels[:, :, i] = (q_context - q_neg_i).detach()
+
+        # Step 4: Train MVE to predict message values
+        messages_train = messages.view(-1, n_agents, message_dim)  # [bs*(seq_len-1), n_agents, message_dim]
+        labels_train = labels.view(-1, n_agents)  # [bs*(seq_len-1), n_agents]
+        mask_train = mask.view(-1, 1).expand(-1, n_agents)  # [bs*(seq_len-1), n_agents]
+
+        # Predict using MVE
+        predicted_values = self.mve(messages_train)  # [bs*(seq_len-1), n_agents]
+
+        # Compute loss
+        mve_loss = self.mve.compute_loss(predicted_values, labels_train, agent_mask=mask_train)
+
+        # Optimize
+        self.mve_optimiser.zero_grad()
+        mve_loss.backward()
+        mve_grad_norm = th.nn.utils.clip_grad_norm_(self.mve.parameters(), self.args.grad_norm_clip)
+        self.mve_optimiser.step()
+
+        # Logging
+        if t_env - self.log_stats_t >= self.args.learner_log_interval:
+            self.logger.log_stat("mve_loss", mve_loss.item(), t_env)
+            self.logger.log_stat("mve_grad_norm", mve_grad_norm.item(), t_env)
+
+            # Log statistics
+            if mask_train.sum() > 0:
+                avg_predicted = (predicted_values * mask_train).sum() / mask_train.sum()
+                avg_label = (labels_train * mask_train).sum() / mask_train.sum()
+                self.logger.log_stat("mve_pred_mean", avg_predicted.item(), t_env)
+                self.logger.log_stat("mve_label_mean", avg_label.item(), t_env)
+
+                # Per-agent statistics (first 4 agents to avoid clutter)
+                for i in range(min(n_agents, 4)):
+                    agent_mask = mask_train[:, i] > 0
+                    if agent_mask.sum() > 0:
+                        avg_value_i = labels_train[agent_mask, i].mean()
+                        self.logger.log_stat(f"mve_value_agent_{i}", avg_value_i.item(), t_env)
+
     def train(self, batch: EpisodeBatch, t_env: int, episode_num: int):
         # Check for phase transitions (automatic three-phase training)
         self._check_phase_transition(t_env)
 
-        # Representation learning training
-        repr_loss = self.repr_train(batch, t_env, episode_num)
-        # RL training
-        self.rl_train(batch, t_env, episode_num, repr_loss)
+        # Phase-specific training
+        if self.current_phase == 1:
+            # Phase 1: Robust Pre-training with message dropout
+            repr_loss = self.repr_train(batch, t_env, episode_num)
+            self.rl_train(batch, t_env, episode_num, repr_loss)
+
+        elif self.current_phase == 2:
+            # Phase 2: Context-Aware MVE Training
+            # Q_base is frozen - only train MVE to predict message values
+            self.mve_train(batch, t_env, episode_num)
+
+        elif self.current_phase == 3:
+            # Phase 3: Value-Conditional Unlearning (TODO: implement)
+            # Resume Q-network training with unlearning objective
+            repr_loss = self.repr_train(batch, t_env, episode_num)
+            self.rl_train(batch, t_env, episode_num, repr_loss)
+            # TODO: Add unlearning logic here
+
+        else:
+            # Default: same as Phase 1
+            repr_loss = self.repr_train(batch, t_env, episode_num)
+            self.rl_train(batch, t_env, episode_num, repr_loss)
 
     def _check_phase_transition(self, t_env):
-        """Check if we should transition to the next phase based on training steps."""
-        steps_in_phase = self.training_steps - self.phase_start_step
+        """Check if we should transition to the next phase based on environment timesteps."""
+        t_env_in_phase = t_env - self.phase_start_t_env
 
         # Phase 1 -> Phase 2 transition
-        if self.current_phase == 1 and steps_in_phase >= getattr(self.args, 'phase1_steps', float('inf')):
+        if self.current_phase == 1 and t_env_in_phase >= getattr(self.args, 'phase1_steps', float('inf')):
             self._transition_to_phase2(t_env)
 
         # Phase 2 -> Phase 3 transition
-        elif self.current_phase == 2 and steps_in_phase >= getattr(self.args, 'phase2_steps', float('inf')):
+        elif self.current_phase == 2 and t_env_in_phase >= getattr(self.args, 'phase2_steps', float('inf')):
             self._transition_to_phase3(t_env)
 
     def _transition_to_phase2(self, t_env):
         """Transition from Phase 1 (Robust Pre-training) to Phase 2 (Context-Aware MVE)."""
         self.logger.console_logger.info(f"\n{'='*60}")
-        self.logger.console_logger.info(f"PHASE TRANSITION: Phase 1 -> Phase 2 at step {self.training_steps}")
+        self.logger.console_logger.info(f"PHASE TRANSITION: Phase 1 -> Phase 2 at t_env {t_env} (training_steps {self.training_steps})")
         self.logger.console_logger.info(f"{'='*60}\n")
 
         # Save Q_base (frozen Q-network for Phase 2 use)
         if getattr(self.args, 'save_phase1_qbase', True):
             self._save_q_base()
 
+        # Create frozen copies of MAC and mixer for MVE training
+        # Use target networks as templates (they were successfully deep copied during init)
+        # Then load current weights to avoid deepcopy issues with computation graphs
+        self.frozen_mac = copy.deepcopy(self.target_mac)
+        self.frozen_mac.load_state_dict(self.mac.state_dict())
+
+        if self.mixer is not None:
+            self.frozen_mixer = copy.deepcopy(self.target_mixer)
+            self.frozen_mixer.load_state_dict(self.mixer.state_dict())
+
+        # Freeze parameters (no gradients)
+        for param in self.frozen_mac.parameters():
+            param.requires_grad = False
+        if self.frozen_mixer is not None:
+            for param in self.frozen_mixer.parameters():
+                param.requires_grad = False
+
+        # Initialize Message Value Estimator (MVE)
+        # Get message dimension from agent's input shape
+        message_dim = self.mac.agent.obs_embed.in_features
+
+        self.mve = mve_REGISTRY["attention"](
+            message_dim=message_dim,
+            n_agents=self.args.n_agents,
+            hidden_dim=getattr(self.args, 'mve_hidden_dim', 64),
+            num_heads=getattr(self.args, 'mve_num_heads', 4),
+            dropout=0.1
+        )
+
+        # Move MVE to device
+        if self.args.use_cuda:
+            self.mve.cuda()
+
+        # Create separate optimizer for MVE
+        mve_lr = getattr(self.args, 'mve_lr', 0.0005)
+        self.mve_optimiser = Adam(params=self.mve.parameters(), lr=mve_lr)
+
+        self.logger.console_logger.info(f"Initialized MVE with message_dim={message_dim}, hidden_dim={self.args.mve_hidden_dim}")
+        self.logger.console_logger.info(f"MVE optimizer lr={mve_lr}")
+
         # Update phase tracking
         self.current_phase = 2
         self.phase_start_step = self.training_steps
+        self.phase_start_t_env = t_env
 
         # Disable message dropout for Phase 2
         self.args.message_dropout_rate = 0.0
@@ -298,12 +491,13 @@ class MASIALearner:
     def _transition_to_phase3(self, t_env):
         """Transition from Phase 2 (Context-Aware MVE) to Phase 3 (Value-Conditional Unlearning)."""
         self.logger.console_logger.info(f"\n{'='*60}")
-        self.logger.console_logger.info(f"PHASE TRANSITION: Phase 2 -> Phase 3 at step {self.training_steps}")
+        self.logger.console_logger.info(f"PHASE TRANSITION: Phase 2 -> Phase 3 at t_env {t_env} (training_steps {self.training_steps})")
         self.logger.console_logger.info(f"{'='*60}\n")
 
         # Update phase tracking
         self.current_phase = 3
         self.phase_start_step = self.training_steps
+        self.phase_start_t_env = t_env
 
         # Log transition
         self.logger.log_stat("training_phase", self.current_phase, t_env)
@@ -375,6 +569,13 @@ class MASIALearner:
         if self.mixer is not None:
             self.mixer.cuda()
             self.target_mixer.cuda()
+        # Phase 2 & 3: MVE and frozen models
+        if self.mve is not None:
+            self.mve.cuda()
+        if self.frozen_mac is not None:
+            self.frozen_mac.cuda()
+        if self.frozen_mixer is not None:
+            self.frozen_mixer.cuda()
 
     def save_models(self, path):
         self.mac.save_models(path)
@@ -382,6 +583,18 @@ class MASIALearner:
             th.save(self.mixer.state_dict(), "{}/mixer.th".format(path))
         th.save(self.latent_model.state_dict(), "{}/latent_model.th".format(path))
         th.save(self.optimiser.state_dict(), "{}/opt.th".format(path))
+
+        # Save phase-specific models
+        th.save({
+            'current_phase': self.current_phase,
+            'phase_start_step': self.phase_start_step,
+            'phase_start_t_env': self.phase_start_t_env
+        }, "{}/phase_info.th".format(path))
+
+        # Phase 2 & 3: Save MVE
+        if self.mve is not None:
+            th.save(self.mve.state_dict(), "{}/mve.th".format(path))
+            th.save(self.mve_optimiser.state_dict(), "{}/mve_opt.th".format(path))
 
     def load_models(self, path):
         self.mac.load_models(path)
@@ -391,3 +604,18 @@ class MASIALearner:
             self.mixer.load_state_dict(th.load("{}/mixer.th".format(path), map_location=lambda storage, loc: storage))
         self.optimiser.load_state_dict(th.load("{}/opt.th".format(path), map_location=lambda storage, loc: storage))
         self.latent_model.load_state_dict(th.load("{}/latent_model.th".format(path), map_location=lambda storage, loc: storage))
+
+        # Load phase info if available
+        import os.path as osp
+        phase_info_path = "{}/phase_info.th".format(path)
+        if osp.exists(phase_info_path):
+            phase_info = th.load(phase_info_path, map_location=lambda storage, loc: storage)
+            self.current_phase = phase_info['current_phase']
+            self.phase_start_step = phase_info['phase_start_step']
+            self.phase_start_t_env = phase_info.get('phase_start_t_env', 0)
+
+        # Load MVE if in Phase 2 or 3
+        mve_path = "{}/mve.th".format(path)
+        if osp.exists(mve_path) and self.mve is not None:
+            self.mve.load_state_dict(th.load(mve_path, map_location=lambda storage, loc: storage))
+            self.mve_optimiser.load_state_dict(th.load("{}/mve_opt.th".format(path), map_location=lambda storage, loc: storage))

@@ -78,6 +78,38 @@ class MASIAAgent(nn.Module):
         # make hidden_states on same device as model
         return self.fc1.weight.new(1, self.args.encoder_hidden_dim).zero_()
 
+    def get_messages(self, inputs, silence_mask=None):
+        """
+        Extract messages (embedded observations) that agents send to each other.
+        This is the output of obs_embed, before the encoder.
+
+        Args:
+            inputs: [bs*n_agents, input_shape] - raw agent inputs
+            silence_mask: Optional [bs, n_agents] binary mask where 1=silence, 0=keep
+
+        Returns:
+            messages: [bs, n_agents, input_shape] - embedded observations (messages)
+        """
+        bs = inputs.shape[0] // self.args.n_agents
+
+        # Step 1: Embed observations (this is the "message" each agent sends)
+        embedded_inputs = self.obs_embed(inputs)  # [bs*n_agents, input_shape]
+
+        # Step 2: Apply silence mask if provided
+        if silence_mask is not None:
+            # silence_mask: [bs, n_agents] where 1=silence, 0=keep
+            # Invert to get keep_mask
+            keep_mask = 1 - silence_mask
+            embedded_inputs_reshaped = embedded_inputs.reshape(bs, self.args.n_agents, -1)
+            keep_mask = keep_mask.unsqueeze(-1).to(embedded_inputs.device)  # [bs, n_agents, 1]
+            embedded_inputs_reshaped = embedded_inputs_reshaped * keep_mask
+            embedded_inputs = embedded_inputs_reshaped.reshape(bs * self.args.n_agents, -1)
+
+        # Reshape to [bs, n_agents, input_shape]
+        messages = embedded_inputs.reshape(bs, self.args.n_agents, -1)
+
+        return messages
+
     def forward(self, inputs, hidden_state, encoder_hidden_state):
         # inputs.shape: [batch_size*n_agents, input_shape]
         bs = inputs.shape[0] // self.args.n_agents
@@ -162,15 +194,38 @@ class MASIAAgent(nn.Module):
 
         return q, h, encoder_h
 
-    def enc_forward(self, inputs, encoder_hidden_state):
+    def enc_forward(self, inputs, encoder_hidden_state, silence_mask=None):
+        """
+        Encode observations to state representations (messages).
+
+        Args:
+            inputs: [bs*n_agents, input_shape] - agent observations
+            encoder_hidden_state: hidden state for encoder RNN
+            silence_mask: Optional [bs, n_agents] binary mask where 1=silence, 0=keep
+                         Used for computing counterfactual Q-values (Q_neg_i) in MVE training
+
+        Returns:
+            z: [bs, n_agents*state_repre_dim] - encoded state representation
+            encoder_h: updated encoder hidden state
+        """
         # inputs.shape: [bs*n_agents, input_shape]
         bs = inputs.shape[0] // self.args.n_agents
 
         # Step 1: Embed observations
         embedded_inputs = self.obs_embed(inputs)
 
-        # Step 2: Apply per-agent message dropout BEFORE encoder
-        if self.training and hasattr(self.args, 'message_dropout_rate') and self.args.message_dropout_rate > 0:
+        # Step 2a: Apply explicit silence mask (for MVE training)
+        if silence_mask is not None:
+            # silence_mask: [bs, n_agents] where 1=silence, 0=keep
+            # Invert to get keep_mask: 1=keep, 0=silence
+            keep_mask = 1 - silence_mask
+            embedded_inputs_reshaped = embedded_inputs.reshape(bs, self.args.n_agents, -1)
+            keep_mask = keep_mask.unsqueeze(-1).to(embedded_inputs.device)  # [bs, n_agents, 1]
+            embedded_inputs_reshaped = embedded_inputs_reshaped * keep_mask
+            embedded_inputs = embedded_inputs_reshaped.reshape(bs * self.args.n_agents, -1)
+
+        # Step 2b: Apply per-agent message dropout BEFORE encoder (training only, if no explicit mask)
+        elif self.training and hasattr(self.args, 'message_dropout_rate') and self.args.message_dropout_rate > 0:
             embedded_inputs_reshaped = embedded_inputs.reshape(bs, self.args.n_agents, -1)
             dropout_mask = (th.rand(bs, self.args.n_agents) > self.args.message_dropout_rate).float()
             dropout_mask = dropout_mask.unsqueeze(-1).to(embedded_inputs.device)

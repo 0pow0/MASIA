@@ -94,10 +94,9 @@ phase3_steps: 100000  # M_unlearn: steps for Phase 3
 message_dropout_rate: 0.3  # p_drop: probability of dropping each agent's message
 save_phase1_qbase: True  # Save frozen Q_base at end of Phase 1
 
-# Phase 2: Context-Aware Value Estimation (Transformer-based MVE)
-mve_hidden_dim: 64  # Hidden dimension for Transformer encoder
+# Phase 2: Context-Aware Value Estimation (Attention-based MVE)
+mve_hidden_dim: 64  # Hidden dimension for attention
 mve_num_heads: 4  # Number of attention heads
-mve_num_layers: 2  # Number of Transformer encoder layers
 mve_lr: 0.0005  # Learning rate for V_phi
 
 # Phase 3: Value-Conditional Unlearning

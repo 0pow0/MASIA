@@ -44,11 +44,40 @@ class MASIAMAC:
         # Go through downstream rl agent
         agent_inputs = self._build_inputs(ep_batch, t)
         agent_outs, self.hidden_states = self.agent.rl_forward(agent_inputs, state_repr, self.hidden_states)
-        return agent_outs.view(ep_batch.batch_size, self.n_agents, -1)        
+        return agent_outs.view(ep_batch.batch_size, self.n_agents, -1)
 
-    def enc_forward(self, ep_batch, t, test_mode=False):
+    def get_messages(self, ep_batch, t, silence_mask=None):
+        """
+        Extract messages (embedded observations) from agents.
+
+        Args:
+            ep_batch: Episode batch
+            t: timestep
+            silence_mask: Optional [bs, n_agents] binary mask where 1=silence, 0=keep
+
+        Returns:
+            messages: [bs, n_agents, input_shape] - embedded observations
+        """
         agent_inputs = self._build_inputs(ep_batch, t)
-        state_repr, self.encoder_hidden_states = self.agent.enc_forward(agent_inputs, self.encoder_hidden_states)
+        messages = self.agent.get_messages(agent_inputs, silence_mask=silence_mask)
+        return messages
+
+    def enc_forward(self, ep_batch, t, test_mode=False, silence_mask=None):
+        """
+        Encode observations to state representations.
+
+        Args:
+            ep_batch: Episode batch
+            t: timestep
+            test_mode: whether in test mode
+            silence_mask: Optional [bs, n_agents] binary mask where 1=silence, 0=keep
+                         Used for MVE training to compute Q_neg_i
+
+        Returns:
+            state_repr: [bs, n_agents*state_repre_dim] or [bs, n_agents, state_repre_dim]
+        """
+        agent_inputs = self._build_inputs(ep_batch, t)
+        state_repr, self.encoder_hidden_states = self.agent.enc_forward(agent_inputs, self.encoder_hidden_states, silence_mask=silence_mask)
         if self.args.state_encoder in ["ob_attn_ae", "ob_attn_skipsum_ae", "ob_attn_skipcat_ae"]:
             return state_repr.view(ep_batch.batch_size, -1)
         else:

@@ -79,6 +79,9 @@ def config_copy(config):
 
 if __name__ == '__main__':
     params = deepcopy(sys.argv)
+    print("="*100)
+    print("RUI")
+    print(params)
     th.set_num_threads(1)
 
     # Get the defaults from default.yaml
