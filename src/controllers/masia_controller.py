@@ -120,6 +120,11 @@ class MASIAMAC:
     def enc_parameters(self):
         return self.agent.enc_parameters()
 
+    @property
+    def comm_l0_norm(self):
+        """Get the L0-norm of embedded_inputs (communication rate metric) from the agent."""
+        return getattr(self.agent, '_comm_l0_norm', None)
+
     def load_state(self, other_mac):
         self.agent.load_state_dict(other_mac.agent.state_dict())
 

@@ -173,6 +173,7 @@ class MASIALearner:
 
         # Calculate estimated Q-Values
         mac_out = []
+        comm_l0_norms = []
         self.mac.init_hidden(batch.batch_size)
         for t in range(batch.max_seq_length):
             state_repr_t = self.mac.enc_forward(batch, t=t)
@@ -180,6 +181,9 @@ class MASIALearner:
                 state_repr_t = state_repr_t.detach()
             agent_outs = self.mac.rl_forward(batch, state_repr_t, t=t)
             mac_out.append(agent_outs)
+            # Collect L0-norm for communication rate metric
+            if self.mac.comm_l0_norm is not None:
+                comm_l0_norms.append(self.mac.comm_l0_norm)
         mac_out = th.stack(mac_out, dim=1)  # Concat over time
         # Pick the Q-Values for the actions taken by each agent
         chosen_action_qvals = th.gather(mac_out[:, :-1], dim=3, index=actions).squeeze(3)  # Remove the last dim
@@ -266,6 +270,13 @@ class MASIALearner:
             self.logger.log_stat("phase_steps", self.training_steps - self.phase_start_step, t_env)
             if hasattr(self.args, 'message_dropout_rate'):
                 self.logger.log_stat("message_dropout_rate", self.args.message_dropout_rate, t_env)
+
+            # Log communication rate (L0-norm of embedded_inputs)
+            # Each L0-norm value is averaged over batch, agents, and message dimensions (at one timestep)
+            # Here we average over timesteps to get overall communication rate
+            if comm_l0_norms:
+                avg_comm_l0_norm = th.stack(comm_l0_norms).mean().item()
+                self.logger.log_stat("comm_l0_norm", avg_comm_l0_norm, t_env)
 
             self.log_stats_t = t_env
 

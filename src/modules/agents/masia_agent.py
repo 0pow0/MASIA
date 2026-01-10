@@ -139,6 +139,12 @@ class MASIAAgent(nn.Module):
             # Flatten back: [bs*n_agents, input_shape]
             embedded_inputs = embedded_inputs_reshaped.reshape(bs * self.args.n_agents, -1)
 
+        # Compute L0-norm of embedded_inputs (communication rate metric)
+        # Communication happens when |value| > threshold (accounts for numerical precision)
+        comm_threshold = 1e-6
+        comm_active = (embedded_inputs.abs() > comm_threshold).float()
+        self._comm_l0_norm = comm_active.mean()
+
         # Step 3: Pass embedded (and possibly dropped) observations to encoder
         if "vae" in self.args.state_encoder:
             raise NotImplementedError
@@ -231,6 +237,12 @@ class MASIAAgent(nn.Module):
             dropout_mask = dropout_mask.unsqueeze(-1).to(embedded_inputs.device)
             embedded_inputs_reshaped = embedded_inputs_reshaped * dropout_mask
             embedded_inputs = embedded_inputs_reshaped.reshape(bs * self.args.n_agents, -1)
+
+        # Compute L0-norm of embedded_inputs (communication rate metric)
+        # Communication happens when |value| > threshold (accounts for numerical precision)
+        comm_threshold = 1e-6
+        comm_active = (embedded_inputs.abs() > comm_threshold).float()
+        self._comm_l0_norm = comm_active.mean()
 
         # Step 3: Encode
         if "vae" in self.args.state_encoder:
