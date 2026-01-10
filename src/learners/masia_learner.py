@@ -59,6 +59,12 @@ class MASIALearner:
         self.frozen_mac = None  # Frozen Q_base for MVE training
         self.frozen_mixer = None
 
+        # Phase 3: Value-Conditional Unlearning
+        self.mu_mve = 0.0  # Global value moving average
+        self.sparsity_lambda = getattr(args, 'sparsity_lambda', 1.0)
+        self.anchor_beta = getattr(args, 'anchor_beta', 0.1)
+        self.mve_ema_tau = getattr(args, 'mve_ema_tau', 0.01)
+
         device = "cuda" if args.use_cuda else "cpu"
         if self.args.standardise_returns:
             self.ret_ms = RunningMeanStd(shape=(self.n_agents,), device=device)
@@ -390,6 +396,145 @@ class MASIALearner:
 
             self.log_stats_t = t_env
 
+    def unlearn_train_and_update(self, batch: EpisodeBatch, t_env: int, episode_num: int):
+        """
+        Phase 3: Value-Conditional Unlearning.
+
+        Uses the trained MVE (V_phi) to guide selective unlearning:
+        - LOW value messages: Apply sparsity loss to force messages toward zero
+        - HIGH value messages: Apply anchoring loss to preserve Q-network behavior
+
+        Algorithm:
+        1. Estimate values v_hat = V_phi(messages)
+        2. Update moving average: mu_mve <- (1-tau)*mu_mve + tau*mean(v_hat)
+        3. Threshold T = lambda * mu_mve
+        4. For each agent i, timestep t:
+           - Deficit D_it = T - v_hat_it
+           - Sparsity Loss: L_sparse = ReLU(D_it) * ||m_it||_1
+           - Anchoring Loss: L_anchor = ||q_base - q_curr||^2
+        5. Total Loss: J = sum(L_sparse + beta * L_anchor)
+        6. Update theta to minimize J
+        """
+        if self.mve is None or self.frozen_mac is None:
+            # MVE or frozen_mac not initialized
+            return
+
+        # Get relevant data from batch
+        actions = batch["actions"][:, :-1]
+        terminated = batch["terminated"][:, :-1].float()
+        mask = batch["filled"][:, :-1].float()
+        mask[:, 1:] = mask[:, 1:] * (1 - terminated[:, :-1])
+
+        bs = batch.batch_size
+        max_seq_length = batch.max_seq_length
+        n_agents = self.args.n_agents
+
+        # Step 1: Extract messages from current MAC (with gradients for sparsity loss)
+        messages_list = []
+        self.mac.init_hidden(bs)
+        for t in range(max_seq_length - 1):
+            messages_t = self.mac.get_messages(batch, t=t, silence_mask=None)
+            messages_list.append(messages_t)
+        # messages: [bs, seq_len-1, n_agents, message_dim]
+        messages = th.stack(messages_list, dim=1)
+        message_dim = messages.shape[-1]
+
+        # Step 2: Get message values from frozen MVE (V_phi)
+        with th.no_grad():
+            messages_flat = messages.view(-1, n_agents, message_dim)  # [bs*(seq_len-1), n_agents, message_dim]
+            v_hat = self.mve(messages_flat)  # [bs*(seq_len-1), n_agents]
+            v_hat = v_hat.view(bs, max_seq_length - 1, n_agents)  # [bs, seq_len-1, n_agents]
+
+        # Step 3: Update global moving average mu_mve
+        mask_expanded = mask.expand_as(v_hat)  # [bs, seq_len-1, n_agents]
+        if mask_expanded.sum() > 0:
+            current_mean_v = (v_hat * mask_expanded).sum() / mask_expanded.sum()
+            self.mu_mve = (1 - self.mve_ema_tau) * self.mu_mve + self.mve_ema_tau * current_mean_v.item()
+
+        # Step 4: Compute dynamic threshold T = lambda * mu_mve
+        threshold_T = self.sparsity_lambda * self.mu_mve
+
+        # Step 5: Compute deficit D_it = T - v_hat_it
+        deficit = threshold_T - v_hat  # [bs, seq_len-1, n_agents]
+
+        # Step 6: Compute Sparsity Loss: L_sparse = ReLU(D_it) * ||m_it||_1
+        # ReLU(D) is positive when v_hat < T (low-value messages)
+        relu_deficit = F.relu(deficit)  # [bs, seq_len-1, n_agents]
+        message_l1_norm = messages.abs().sum(dim=-1)  # [bs, seq_len-1, n_agents]
+        sparsity_loss_per_agent = relu_deficit.detach() * message_l1_norm  # [bs, seq_len-1, n_agents]
+
+        # Apply mask and compute mean sparsity loss
+        sparsity_loss = (sparsity_loss_per_agent * mask_expanded).sum() / mask_expanded.sum()
+
+        # Step 7: Compute Anchoring Loss: L_anchor = ||q_base - q_curr||^2
+        # Get Q-values from frozen Q_base
+        with th.no_grad():
+            mac_out_base = []
+            self.frozen_mac.init_hidden(bs)
+            for t in range(max_seq_length - 1):
+                state_repr_t = self.frozen_mac.enc_forward(batch, t=t, silence_mask=None)
+                agent_outs = self.frozen_mac.rl_forward(batch, state_repr_t, t=t)
+                mac_out_base.append(agent_outs)
+            mac_out_base = th.stack(mac_out_base, dim=1)  # [bs, seq_len-1, n_agents, n_actions]
+            # Get Q-values for chosen actions
+            q_base = th.gather(mac_out_base, dim=3, index=actions).squeeze(3)  # [bs, seq_len-1, n_agents]
+
+        # Get Q-values from current MAC (with gradients)
+        mac_out_curr = []
+        self.mac.init_hidden(bs)
+        for t in range(max_seq_length - 1):
+            state_repr_t = self.mac.enc_forward(batch, t=t, silence_mask=None)
+            agent_outs = self.mac.rl_forward(batch, state_repr_t, t=t)
+            mac_out_curr.append(agent_outs)
+        mac_out_curr = th.stack(mac_out_curr, dim=1)  # [bs, seq_len-1, n_agents, n_actions]
+        q_curr = th.gather(mac_out_curr, dim=3, index=actions).squeeze(3)  # [bs, seq_len-1, n_agents]
+
+        # Anchoring loss: MSE between q_base and q_curr
+        anchor_loss_per_agent = (q_base.detach() - q_curr) ** 2  # [bs, seq_len-1, n_agents]
+        anchor_loss = (anchor_loss_per_agent * mask_expanded).sum() / mask_expanded.sum()
+
+        # Step 8: Total unlearning loss: J = L_sparse + beta * L_anchor
+        unlearn_loss = sparsity_loss + self.anchor_beta * anchor_loss
+
+        # Step 9: Optimization - update theta to minimize J
+        self.optimiser.zero_grad()
+        unlearn_loss.backward()
+        grad_norm = th.nn.utils.clip_grad_norm_(self.params, self.args.grad_norm_clip)
+        self.optimiser.step()
+
+        # Update training steps counter
+        self.training_steps += 1
+
+        # Logging
+        if t_env - self.log_stats_t >= self.args.learner_log_interval:
+            self.logger.log_stat("unlearn_loss", unlearn_loss.item(), t_env)
+            self.logger.log_stat("sparsity_loss", sparsity_loss.item(), t_env)
+            self.logger.log_stat("anchor_loss", anchor_loss.item(), t_env)
+            self.logger.log_stat("mu_mve", self.mu_mve, t_env)
+            self.logger.log_stat("threshold_T", threshold_T, t_env)
+            self.logger.log_stat("unlearn_grad_norm", grad_norm.item(), t_env)
+
+            # Log statistics about deficit and message norms
+            if mask_expanded.sum() > 0:
+                avg_v_hat = (v_hat * mask_expanded).sum() / mask_expanded.sum()
+                avg_deficit = (deficit * mask_expanded).sum() / mask_expanded.sum()
+                avg_relu_deficit = (relu_deficit * mask_expanded).sum() / mask_expanded.sum()
+                avg_msg_norm = (message_l1_norm * mask_expanded).sum() / mask_expanded.sum()
+                pct_low_value = ((deficit > 0).float() * mask_expanded).sum() / mask_expanded.sum()
+
+                self.logger.log_stat("avg_v_hat", avg_v_hat.item(), t_env)
+                self.logger.log_stat("avg_deficit", avg_deficit.item(), t_env)
+                self.logger.log_stat("avg_relu_deficit", avg_relu_deficit.item(), t_env)
+                self.logger.log_stat("avg_message_l1_norm", avg_msg_norm.item(), t_env)
+                self.logger.log_stat("pct_low_value_msgs", pct_low_value.item(), t_env)
+
+            # Three-phase training logging
+            self.logger.log_stat("training_phase", self.current_phase, t_env)
+            self.logger.log_stat("phase_t_env", t_env - self.phase_start_t_env, t_env)
+            self.logger.log_stat("phase_steps", self.training_steps - self.phase_start_step, t_env)
+
+            self.log_stats_t = t_env
+
     def train(self, batch: EpisodeBatch, t_env: int, episode_num: int):
         # Check for phase transitions (automatic three-phase training)
         self._check_phase_transition(t_env)
@@ -406,11 +551,8 @@ class MASIALearner:
             self.mve_train(batch, t_env, episode_num)
 
         elif self.current_phase == 3:
-            # Phase 3: Value-Conditional Unlearning (TODO: implement)
-            # Resume Q-network training with unlearning objective
-            repr_loss = self.repr_train(batch, t_env, episode_num)
-            self.rl_train(batch, t_env, episode_num, repr_loss)
-            # TODO: Add unlearning logic here
+            # Phase 3: Value-Conditional Unlearning only
+            self.unlearn_train_and_update(batch, t_env, episode_num)
 
         else:
             # Default: same as Phase 1
@@ -512,6 +654,23 @@ class MASIALearner:
         self.logger.console_logger.info(f"PHASE TRANSITION: Phase 2 -> Phase 3 at t_env {t_env} (training_steps {self.training_steps})")
         self.logger.console_logger.info(f"{'='*60}\n")
 
+        # Initialize global value moving average for Phase 3
+        self.mu_mve = 0.0
+
+        # Freeze MVE parameters (V_phi should not be updated in Phase 3)
+        if self.mve is not None:
+            for param in self.mve.parameters():
+                param.requires_grad = False
+            self.logger.console_logger.info("Froze MVE (V_phi) parameters for Phase 3")
+
+        # Get Phase 3 hyperparameters
+        self.sparsity_lambda = getattr(self.args, 'sparsity_lambda', 1.0)
+        self.anchor_beta = getattr(self.args, 'anchor_beta', 0.1)
+        self.mve_ema_tau = getattr(self.args, 'mve_ema_tau', 0.01)
+
+        self.logger.console_logger.info(f"Phase 3 hyperparameters: sparsity_lambda={self.sparsity_lambda}, "
+                                        f"anchor_beta={self.anchor_beta}, mve_ema_tau={self.mve_ema_tau}")
+
         # Update phase tracking
         self.current_phase = 3
         self.phase_start_step = self.training_steps
@@ -606,13 +765,18 @@ class MASIALearner:
         th.save({
             'current_phase': self.current_phase,
             'phase_start_step': self.phase_start_step,
-            'phase_start_t_env': self.phase_start_t_env
+            'phase_start_t_env': self.phase_start_t_env,
+            'mu_mve': self.mu_mve  # Phase 3: global value moving average
         }, "{}/phase_info.th".format(path))
 
-        # Phase 2 & 3: Save MVE
+        # Phase 2 & 3: Save MVE and frozen models
         if self.mve is not None:
             th.save(self.mve.state_dict(), "{}/mve.th".format(path))
             th.save(self.mve_optimiser.state_dict(), "{}/mve_opt.th".format(path))
+        if self.frozen_mac is not None:
+            th.save(self.frozen_mac.agent.state_dict(), "{}/frozen_agent.th".format(path))
+        if self.frozen_mixer is not None:
+            th.save(self.frozen_mixer.state_dict(), "{}/frozen_mixer.th".format(path))
 
     def load_models(self, path):
         self.mac.load_models(path)
@@ -631,9 +795,60 @@ class MASIALearner:
             self.current_phase = phase_info['current_phase']
             self.phase_start_step = phase_info['phase_start_step']
             self.phase_start_t_env = phase_info.get('phase_start_t_env', 0)
+            self.mu_mve = phase_info.get('mu_mve', 0.0)  # Phase 3: global value moving average
 
-        # Load MVE if in Phase 2 or 3
+        # Initialize and load Phase 2/3 components if needed
         mve_path = "{}/mve.th".format(path)
-        if osp.exists(mve_path) and self.mve is not None:
+        frozen_agent_path = "{}/frozen_agent.th".format(path)
+        frozen_mixer_path = "{}/frozen_mixer.th".format(path)
+
+        if self.current_phase >= 2 and osp.exists(mve_path):
+            # Initialize MVE if not already initialized
+            if self.mve is None:
+                message_dim = self.mac.agent.obs_embed.in_features
+                self.mve = mve_REGISTRY["attention"](
+                    message_dim=message_dim,
+                    n_agents=self.args.n_agents,
+                    hidden_dim=getattr(self.args, 'mve_hidden_dim', 64),
+                    num_heads=getattr(self.args, 'mve_num_heads', 4),
+                    dropout=0.1
+                )
+                if self.args.use_cuda:
+                    self.mve.cuda()
+                mve_lr = getattr(self.args, 'mve_lr', 0.0005)
+                self.mve_optimiser = Adam(params=self.mve.parameters(), lr=mve_lr)
+
+            # Load MVE state
             self.mve.load_state_dict(th.load(mve_path, map_location=lambda storage, loc: storage))
-            self.mve_optimiser.load_state_dict(th.load("{}/mve_opt.th".format(path), map_location=lambda storage, loc: storage))
+            mve_opt_path = "{}/mve_opt.th".format(path)
+            if osp.exists(mve_opt_path):
+                self.mve_optimiser.load_state_dict(th.load(mve_opt_path, map_location=lambda storage, loc: storage))
+
+            # Initialize frozen_mac if not already initialized
+            if self.frozen_mac is None and osp.exists(frozen_agent_path):
+                self.frozen_mac = type(self.mac)(self.mac.scheme, self.mac.groups, self.mac.args)
+                self.frozen_mac.agent.load_state_dict(th.load(frozen_agent_path, map_location=lambda storage, loc: storage))
+                if self.args.use_cuda:
+                    self.frozen_mac.cuda()
+                for param in self.frozen_mac.parameters():
+                    param.requires_grad = False
+
+            # Initialize frozen_mixer if not already initialized
+            if self.frozen_mixer is None and self.mixer is not None and osp.exists(frozen_mixer_path):
+                if self.args.mixer == "vdn":
+                    self.frozen_mixer = type(self.mixer)()
+                else:
+                    self.frozen_mixer = type(self.mixer)(self.args)
+                self.frozen_mixer.load_state_dict(th.load(frozen_mixer_path, map_location=lambda storage, loc: storage))
+                if self.args.use_cuda:
+                    self.frozen_mixer.cuda()
+                for param in self.frozen_mixer.parameters():
+                    param.requires_grad = False
+
+            # Disable message dropout for Phase 2/3
+            self.args.message_dropout_rate = 0.0
+
+            # Freeze MVE if in Phase 3
+            if self.current_phase == 3 and self.mve is not None:
+                for param in self.mve.parameters():
+                    param.requires_grad = False
