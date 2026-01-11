@@ -126,3 +126,7 @@ class EpisodeRunner:
             if k != "n_episodes":
                 self.logger.log_stat(prefix + k + "_mean" , v/stats["n_episodes"], self.t_env)
         stats.clear()
+
+        # Log evaluation message dropout rate if configured
+        if hasattr(self.args, 'eval_message_dropout_rate') and self.args.eval_message_dropout_rate > 0:
+            self.logger.log_stat(prefix + "eval_message_dropout_rate", self.args.eval_message_dropout_rate, self.t_env)
