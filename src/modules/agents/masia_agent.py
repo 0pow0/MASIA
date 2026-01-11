@@ -139,6 +139,14 @@ class MASIAAgent(nn.Module):
             # Flatten back: [bs*n_agents, input_shape]
             embedded_inputs = embedded_inputs_reshaped.reshape(bs * self.args.n_agents, -1)
 
+        # Evaluation dropout (applied during test/eval mode for robustness testing)
+        if not self.training and hasattr(self.args, 'eval_message_dropout_rate') and self.args.eval_message_dropout_rate > 0:
+            embedded_inputs_reshaped = embedded_inputs.reshape(bs, self.args.n_agents, -1)
+            dropout_mask = (th.rand(bs, self.args.n_agents) > self.args.eval_message_dropout_rate).float()
+            dropout_mask = dropout_mask.unsqueeze(-1).to(embedded_inputs.device)
+            embedded_inputs_reshaped = embedded_inputs_reshaped * dropout_mask
+            embedded_inputs = embedded_inputs_reshaped.reshape(bs * self.args.n_agents, -1)
+
         # Compute L0-norm of embedded_inputs (communication rate metric)
         # Communication happens when |value| > threshold (accounts for numerical precision)
         comm_threshold = 1e-6
@@ -234,6 +242,14 @@ class MASIAAgent(nn.Module):
         elif self.training and hasattr(self.args, 'message_dropout_rate') and self.args.message_dropout_rate > 0:
             embedded_inputs_reshaped = embedded_inputs.reshape(bs, self.args.n_agents, -1)
             dropout_mask = (th.rand(bs, self.args.n_agents) > self.args.message_dropout_rate).float()
+            dropout_mask = dropout_mask.unsqueeze(-1).to(embedded_inputs.device)
+            embedded_inputs_reshaped = embedded_inputs_reshaped * dropout_mask
+            embedded_inputs = embedded_inputs_reshaped.reshape(bs * self.args.n_agents, -1)
+
+        # Step 2c: Evaluation dropout (applied during test/eval mode for robustness testing)
+        elif not self.training and hasattr(self.args, 'eval_message_dropout_rate') and self.args.eval_message_dropout_rate > 0:
+            embedded_inputs_reshaped = embedded_inputs.reshape(bs, self.args.n_agents, -1)
+            dropout_mask = (th.rand(bs, self.args.n_agents) > self.args.eval_message_dropout_rate).float()
             dropout_mask = dropout_mask.unsqueeze(-1).to(embedded_inputs.device)
             embedded_inputs_reshaped = embedded_inputs_reshaped * dropout_mask
             embedded_inputs = embedded_inputs_reshaped.reshape(bs * self.args.n_agents, -1)
