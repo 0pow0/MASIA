@@ -320,6 +320,7 @@ class MASIALearner:
         message_dim = messages.shape[-1]
 
         # Step 2: Compute Q_context (Q-values with all agents communicating)
+        comm_l0_norms = []
         with th.no_grad():
             mac_out_context = []
             self.frozen_mac.init_hidden(bs)
@@ -328,6 +329,9 @@ class MASIALearner:
                 state_repr_t = self.frozen_mac.enc_forward(batch, t=t, silence_mask=None)
                 agent_outs = self.frozen_mac.rl_forward(batch, state_repr_t, t=t)
                 mac_out_context.append(agent_outs)
+                # Collect L0-norm for communication rate metric
+                if self.frozen_mac.comm_l0_norm is not None:
+                    comm_l0_norms.append(self.frozen_mac.comm_l0_norm)
 
             mac_out_context = th.stack(mac_out_context, dim=1)  # [bs, seq_len-1, n_agents, n_actions]
             chosen_qvals_context = th.gather(mac_out_context, dim=3, index=actions).squeeze(3)  # [bs, seq_len-1, n_agents]
@@ -405,6 +409,11 @@ class MASIALearner:
                         avg_value_i = labels_train[agent_mask, i].mean()
                         self.logger.log_stat(f"mve_value_agent_{i}", avg_value_i.item(), t_env)
 
+            # Log communication rate (L0-norm)
+            if comm_l0_norms:
+                avg_comm_l0_norm = th.stack(comm_l0_norms).mean().item()
+                self.logger.log_stat("comm_l0_norm", avg_comm_l0_norm, t_env)
+
             self.log_stats_t = t_env
 
     def unlearn_train_and_update(self, batch: EpisodeBatch, t_env: int, episode_num: int):
@@ -442,10 +451,14 @@ class MASIALearner:
 
         # Step 1: Extract messages from current MAC (with gradients for sparsity loss)
         messages_list = []
+        comm_l0_norms = []
         self.mac.init_hidden(bs)
         for t in range(max_seq_length - 1):
             messages_t = self.mac.get_messages(batch, t=t, silence_mask=None)
             messages_list.append(messages_t)
+            # Collect L0-norm for communication rate metric
+            if self.mac.comm_l0_norm is not None:
+                comm_l0_norms.append(self.mac.comm_l0_norm)
         # messages: [bs, seq_len-1, n_agents, message_dim]
         messages = th.stack(messages_list, dim=1)
         message_dim = messages.shape[-1]
@@ -543,6 +556,11 @@ class MASIALearner:
             self.logger.log_stat("training_phase", self.current_phase, t_env)
             self.logger.log_stat("phase_t_env", t_env - self.phase_start_t_env, t_env)
             self.logger.log_stat("phase_steps", self.training_steps - self.phase_start_step, t_env)
+
+            # Log communication rate (L0-norm)
+            if comm_l0_norms:
+                avg_comm_l0_norm = th.stack(comm_l0_norms).mean().item()
+                self.logger.log_stat("comm_l0_norm", avg_comm_l0_norm, t_env)
 
             self.log_stats_t = t_env
 
