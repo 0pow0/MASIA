@@ -149,7 +149,7 @@ class MASIAAgent(nn.Module):
 
         # Compute L0-norm of embedded_inputs (communication rate metric)
         # Communication happens when |value| > threshold (accounts for numerical precision)
-        comm_threshold = 1e-6
+        comm_threshold = 0.01 
         comm_active = (embedded_inputs.abs() > comm_threshold).float()
         self._comm_l0_norm = comm_active.mean()
 
@@ -256,7 +256,7 @@ class MASIAAgent(nn.Module):
 
         # Compute L0-norm of embedded_inputs (communication rate metric)
         # Communication happens when |value| > threshold (accounts for numerical precision)
-        comm_threshold = 1e-6
+        comm_threshold = 0.01
         comm_active = (embedded_inputs.abs() > comm_threshold).float()
         self._comm_l0_norm = comm_active.mean()
 
