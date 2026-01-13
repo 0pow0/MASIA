@@ -69,6 +69,9 @@ class MASIALearner:
         self.skip_mve = getattr(args, 'skip_mve', False)
         self.l1_lambda = getattr(args, 'l1_lambda', 0.01)
 
+        # Ablation: Skip anchor loss in phase 3
+        self.skip_anchor = getattr(args, 'skip_anchor', False)
+
         device = "cuda" if args.use_cuda else "cpu"
         if self.args.standardise_returns:
             self.ret_ms = RunningMeanStd(shape=(self.n_agents,), device=device)
@@ -494,35 +497,40 @@ class MASIALearner:
         # Apply mask and compute mean sparsity loss
         sparsity_loss = (sparsity_loss_per_agent * mask_expanded).sum() / mask_expanded.sum()
 
-        # Step 7: Compute Anchoring Loss: L_anchor = ||q_base - q_curr||^2
-        # Get Q-values from frozen Q_base
-        with th.no_grad():
-            mac_out_base = []
-            self.frozen_mac.init_hidden(bs)
+        # Step 7: Compute Anchoring Loss: L_anchor = ||q_base - q_curr||^2 (unless skip_anchor ablation)
+        if self.skip_anchor:
+            # Ablation: skip anchor loss entirely
+            anchor_loss = th.tensor(0.0, device=messages.device)
+            unlearn_loss = sparsity_loss
+        else:
+            # Get Q-values from frozen Q_base
+            with th.no_grad():
+                mac_out_base = []
+                self.frozen_mac.init_hidden(bs)
+                for t in range(max_seq_length - 1):
+                    state_repr_t = self.frozen_mac.enc_forward(batch, t=t, silence_mask=None)
+                    agent_outs = self.frozen_mac.rl_forward(batch, state_repr_t, t=t)
+                    mac_out_base.append(agent_outs)
+                mac_out_base = th.stack(mac_out_base, dim=1)  # [bs, seq_len-1, n_agents, n_actions]
+                # Get Q-values for chosen actions
+                q_base = th.gather(mac_out_base, dim=3, index=actions).squeeze(3)  # [bs, seq_len-1, n_agents]
+
+            # Get Q-values from current MAC (with gradients)
+            mac_out_curr = []
+            self.mac.init_hidden(bs)
             for t in range(max_seq_length - 1):
-                state_repr_t = self.frozen_mac.enc_forward(batch, t=t, silence_mask=None)
-                agent_outs = self.frozen_mac.rl_forward(batch, state_repr_t, t=t)
-                mac_out_base.append(agent_outs)
-            mac_out_base = th.stack(mac_out_base, dim=1)  # [bs, seq_len-1, n_agents, n_actions]
-            # Get Q-values for chosen actions
-            q_base = th.gather(mac_out_base, dim=3, index=actions).squeeze(3)  # [bs, seq_len-1, n_agents]
+                state_repr_t = self.mac.enc_forward(batch, t=t, silence_mask=None)
+                agent_outs = self.mac.rl_forward(batch, state_repr_t, t=t)
+                mac_out_curr.append(agent_outs)
+            mac_out_curr = th.stack(mac_out_curr, dim=1)  # [bs, seq_len-1, n_agents, n_actions]
+            q_curr = th.gather(mac_out_curr, dim=3, index=actions).squeeze(3)  # [bs, seq_len-1, n_agents]
 
-        # Get Q-values from current MAC (with gradients)
-        mac_out_curr = []
-        self.mac.init_hidden(bs)
-        for t in range(max_seq_length - 1):
-            state_repr_t = self.mac.enc_forward(batch, t=t, silence_mask=None)
-            agent_outs = self.mac.rl_forward(batch, state_repr_t, t=t)
-            mac_out_curr.append(agent_outs)
-        mac_out_curr = th.stack(mac_out_curr, dim=1)  # [bs, seq_len-1, n_agents, n_actions]
-        q_curr = th.gather(mac_out_curr, dim=3, index=actions).squeeze(3)  # [bs, seq_len-1, n_agents]
+            # Anchoring loss: MSE between q_base and q_curr
+            anchor_loss_per_agent = (q_base.detach() - q_curr) ** 2  # [bs, seq_len-1, n_agents]
+            anchor_loss = (anchor_loss_per_agent * mask_expanded).sum() / mask_expanded.sum()
 
-        # Anchoring loss: MSE between q_base and q_curr
-        anchor_loss_per_agent = (q_base.detach() - q_curr) ** 2  # [bs, seq_len-1, n_agents]
-        anchor_loss = (anchor_loss_per_agent * mask_expanded).sum() / mask_expanded.sum()
-
-        # Step 8: Total unlearning loss: J = L_sparse + beta * L_anchor
-        unlearn_loss = sparsity_loss + self.anchor_beta * anchor_loss
+            # Step 8: Total unlearning loss: J = L_sparse + beta * L_anchor
+            unlearn_loss = sparsity_loss + self.anchor_beta * anchor_loss
 
         # Step 9: Optimization - update theta to minimize J
         self.optimiser.zero_grad()
@@ -607,35 +615,40 @@ class MASIALearner:
         message_l1_norm = messages.abs().sum(dim=-1)  # [bs, seq_len-1, n_agents]
         l1_loss = (message_l1_norm * mask_expanded).sum() / mask_expanded.sum()
 
-        # Step 3: Compute Anchoring Loss: L_anchor = ||q_base - q_curr||^2
-        # Get Q-values from frozen Q_base
-        with th.no_grad():
-            mac_out_base = []
-            self.frozen_mac.init_hidden(bs)
+        # Step 3: Compute Anchoring Loss: L_anchor = ||q_base - q_curr||^2 (unless skip_anchor ablation)
+        if self.skip_anchor:
+            # Ablation: skip anchor loss entirely
+            anchor_loss = th.tensor(0.0, device=messages.device)
+            unlearn_loss = self.l1_lambda * l1_loss
+        else:
+            # Get Q-values from frozen Q_base
+            with th.no_grad():
+                mac_out_base = []
+                self.frozen_mac.init_hidden(bs)
+                for t in range(max_seq_length - 1):
+                    state_repr_t = self.frozen_mac.enc_forward(batch, t=t, silence_mask=None)
+                    agent_outs = self.frozen_mac.rl_forward(batch, state_repr_t, t=t)
+                    mac_out_base.append(agent_outs)
+                mac_out_base = th.stack(mac_out_base, dim=1)  # [bs, seq_len-1, n_agents, n_actions]
+                # Get Q-values for chosen actions
+                q_base = th.gather(mac_out_base, dim=3, index=actions).squeeze(3)  # [bs, seq_len-1, n_agents]
+
+            # Get Q-values from current MAC (with gradients)
+            mac_out_curr = []
+            self.mac.init_hidden(bs)
             for t in range(max_seq_length - 1):
-                state_repr_t = self.frozen_mac.enc_forward(batch, t=t, silence_mask=None)
-                agent_outs = self.frozen_mac.rl_forward(batch, state_repr_t, t=t)
-                mac_out_base.append(agent_outs)
-            mac_out_base = th.stack(mac_out_base, dim=1)  # [bs, seq_len-1, n_agents, n_actions]
-            # Get Q-values for chosen actions
-            q_base = th.gather(mac_out_base, dim=3, index=actions).squeeze(3)  # [bs, seq_len-1, n_agents]
+                state_repr_t = self.mac.enc_forward(batch, t=t, silence_mask=None)
+                agent_outs = self.mac.rl_forward(batch, state_repr_t, t=t)
+                mac_out_curr.append(agent_outs)
+            mac_out_curr = th.stack(mac_out_curr, dim=1)  # [bs, seq_len-1, n_agents, n_actions]
+            q_curr = th.gather(mac_out_curr, dim=3, index=actions).squeeze(3)  # [bs, seq_len-1, n_agents]
 
-        # Get Q-values from current MAC (with gradients)
-        mac_out_curr = []
-        self.mac.init_hidden(bs)
-        for t in range(max_seq_length - 1):
-            state_repr_t = self.mac.enc_forward(batch, t=t, silence_mask=None)
-            agent_outs = self.mac.rl_forward(batch, state_repr_t, t=t)
-            mac_out_curr.append(agent_outs)
-        mac_out_curr = th.stack(mac_out_curr, dim=1)  # [bs, seq_len-1, n_agents, n_actions]
-        q_curr = th.gather(mac_out_curr, dim=3, index=actions).squeeze(3)  # [bs, seq_len-1, n_agents]
+            # Anchoring loss: MSE between q_base and q_curr
+            anchor_loss_per_agent = (q_base.detach() - q_curr) ** 2  # [bs, seq_len-1, n_agents]
+            anchor_loss = (anchor_loss_per_agent * mask_expanded).sum() / mask_expanded.sum()
 
-        # Anchoring loss: MSE between q_base and q_curr
-        anchor_loss_per_agent = (q_base.detach() - q_curr) ** 2  # [bs, seq_len-1, n_agents]
-        anchor_loss = (anchor_loss_per_agent * mask_expanded).sum() / mask_expanded.sum()
-
-        # Step 4: Total unlearning loss: J = l1_lambda * L1 + anchor_beta * L_anchor
-        unlearn_loss = self.l1_lambda * l1_loss + self.anchor_beta * anchor_loss
+            # Step 4: Total unlearning loss: J = l1_lambda * L1 + anchor_beta * L_anchor
+            unlearn_loss = self.l1_lambda * l1_loss + self.anchor_beta * anchor_loss
 
         # Step 5: Optimization
         self.optimiser.zero_grad()

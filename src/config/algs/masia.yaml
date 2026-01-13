@@ -102,4 +102,9 @@ mve_lr: 0.0005  # Learning rate for V_phi
 # Phase 3: Value-Conditional Unlearning
 sparsity_lambda: 1.0  # Lambda: threshold multiplier for value-based pruning
 anchor_beta: 0.1  # Beta: weight for anchoring loss (keep high-value behavior stable)
-mve_ema_tau: 0.01  # Tau: momentum for moving average of MVE values (mu_mve) 
+mve_ema_tau: 0.01  # Tau: momentum for moving average of MVE values (mu_mve)
+
+# Ablation flags
+skip_mve: False  # Ablation: skip Phase 2 (MVE training), use pure L1 in Phase 3
+skip_anchor: False  # Ablation: skip anchor loss in Phase 3 (no Q-value preservation)
+l1_lambda: 0.01  # Weight for pure L1 norm (used when skip_mve=True) 
