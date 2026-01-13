@@ -65,6 +65,10 @@ class MASIALearner:
         self.anchor_beta = getattr(args, 'anchor_beta', 0.1)
         self.mve_ema_tau = getattr(args, 'mve_ema_tau', 0.01)
 
+        # Ablation: Skip MVE (phase 2), use pure L1 norm in phase 3
+        self.skip_mve = getattr(args, 'skip_mve', False)
+        self.l1_lambda = getattr(args, 'l1_lambda', 0.01)
+
         device = "cuda" if args.use_cuda else "cpu"
         if self.args.standardise_returns:
             self.ret_ms = RunningMeanStd(shape=(self.n_agents,), device=device)
@@ -564,6 +568,108 @@ class MASIALearner:
 
             self.log_stats_t = t_env
 
+    def unlearn_train_no_mve(self, batch: EpisodeBatch, t_env: int, episode_num: int):
+        """
+        Phase 3 Ablation: Unlearning without MVE.
+
+        Uses pure L1 norm + anchor loss instead of value-weighted sparsity.
+        Loss = l1_lambda * ||m||_1 + anchor_beta * ||q_base - q_curr||^2
+        """
+        if self.frozen_mac is None:
+            # Frozen MAC not initialized
+            return
+
+        # Get relevant data from batch
+        actions = batch["actions"][:, :-1]
+        terminated = batch["terminated"][:, :-1].float()
+        mask = batch["filled"][:, :-1].float()
+        mask[:, 1:] = mask[:, 1:] * (1 - terminated[:, :-1])
+
+        bs = batch.batch_size
+        max_seq_length = batch.max_seq_length
+        n_agents = self.args.n_agents
+
+        # Step 1: Extract messages from current MAC (with gradients for L1 loss)
+        messages_list = []
+        comm_l0_norms = []
+        self.mac.init_hidden(bs)
+        for t in range(max_seq_length - 1):
+            messages_t = self.mac.get_messages(batch, t=t, silence_mask=None)
+            messages_list.append(messages_t)
+            # Collect L0-norm for communication rate metric
+            if self.mac.comm_l0_norm is not None:
+                comm_l0_norms.append(self.mac.comm_l0_norm)
+        # messages: [bs, seq_len-1, n_agents, message_dim]
+        messages = th.stack(messages_list, dim=1)
+
+        # Step 2: Compute pure L1 norm loss (no value-weighting)
+        mask_expanded = mask.expand(-1, -1, n_agents)  # [bs, seq_len-1, n_agents]
+        message_l1_norm = messages.abs().sum(dim=-1)  # [bs, seq_len-1, n_agents]
+        l1_loss = (message_l1_norm * mask_expanded).sum() / mask_expanded.sum()
+
+        # Step 3: Compute Anchoring Loss: L_anchor = ||q_base - q_curr||^2
+        # Get Q-values from frozen Q_base
+        with th.no_grad():
+            mac_out_base = []
+            self.frozen_mac.init_hidden(bs)
+            for t in range(max_seq_length - 1):
+                state_repr_t = self.frozen_mac.enc_forward(batch, t=t, silence_mask=None)
+                agent_outs = self.frozen_mac.rl_forward(batch, state_repr_t, t=t)
+                mac_out_base.append(agent_outs)
+            mac_out_base = th.stack(mac_out_base, dim=1)  # [bs, seq_len-1, n_agents, n_actions]
+            # Get Q-values for chosen actions
+            q_base = th.gather(mac_out_base, dim=3, index=actions).squeeze(3)  # [bs, seq_len-1, n_agents]
+
+        # Get Q-values from current MAC (with gradients)
+        mac_out_curr = []
+        self.mac.init_hidden(bs)
+        for t in range(max_seq_length - 1):
+            state_repr_t = self.mac.enc_forward(batch, t=t, silence_mask=None)
+            agent_outs = self.mac.rl_forward(batch, state_repr_t, t=t)
+            mac_out_curr.append(agent_outs)
+        mac_out_curr = th.stack(mac_out_curr, dim=1)  # [bs, seq_len-1, n_agents, n_actions]
+        q_curr = th.gather(mac_out_curr, dim=3, index=actions).squeeze(3)  # [bs, seq_len-1, n_agents]
+
+        # Anchoring loss: MSE between q_base and q_curr
+        anchor_loss_per_agent = (q_base.detach() - q_curr) ** 2  # [bs, seq_len-1, n_agents]
+        anchor_loss = (anchor_loss_per_agent * mask_expanded).sum() / mask_expanded.sum()
+
+        # Step 4: Total unlearning loss: J = l1_lambda * L1 + anchor_beta * L_anchor
+        unlearn_loss = self.l1_lambda * l1_loss + self.anchor_beta * anchor_loss
+
+        # Step 5: Optimization
+        self.optimiser.zero_grad()
+        unlearn_loss.backward()
+        grad_norm = th.nn.utils.clip_grad_norm_(self.params, self.args.grad_norm_clip)
+        self.optimiser.step()
+
+        # Update training steps counter
+        self.training_steps += 1
+
+        # Logging
+        if t_env - self.log_stats_t >= self.args.learner_log_interval:
+            self.logger.log_stat("unlearn_loss", unlearn_loss.item(), t_env)
+            self.logger.log_stat("l1_loss", l1_loss.item(), t_env)
+            self.logger.log_stat("anchor_loss", anchor_loss.item(), t_env)
+            self.logger.log_stat("unlearn_grad_norm", grad_norm.item(), t_env)
+
+            # Log message norm statistics
+            if mask_expanded.sum() > 0:
+                avg_msg_norm = (message_l1_norm * mask_expanded).sum() / mask_expanded.sum()
+                self.logger.log_stat("avg_message_l1_norm", avg_msg_norm.item(), t_env)
+
+            # Three-phase training logging
+            self.logger.log_stat("training_phase", self.current_phase, t_env)
+            self.logger.log_stat("phase_t_env", t_env - self.phase_start_t_env, t_env)
+            self.logger.log_stat("phase_steps", self.training_steps - self.phase_start_step, t_env)
+
+            # Log communication rate (L0-norm)
+            if comm_l0_norms:
+                avg_comm_l0_norm = th.stack(comm_l0_norms).mean().item()
+                self.logger.log_stat("comm_l0_norm", avg_comm_l0_norm, t_env)
+
+            self.log_stats_t = t_env
+
     def train(self, batch: EpisodeBatch, t_env: int, episode_num: int):
         # Check for phase transitions (automatic three-phase training)
         self._check_phase_transition(t_env)
@@ -580,8 +686,13 @@ class MASIALearner:
             self.mve_train(batch, t_env, episode_num)
 
         elif self.current_phase == 3:
-            # Phase 3: Value-Conditional Unlearning only
-            self.unlearn_train_and_update(batch, t_env, episode_num)
+            # Phase 3: Unlearning
+            if self.skip_mve:
+                # Ablation: use pure L1 norm + anchor loss (no MVE)
+                self.unlearn_train_no_mve(batch, t_env, episode_num)
+            else:
+                # Full method: Value-Conditional Unlearning with MVE
+                self.unlearn_train_and_update(batch, t_env, episode_num)
 
         else:
             # Default: same as Phase 1
@@ -592,9 +703,13 @@ class MASIALearner:
         """Check if we should transition to the next phase based on environment timesteps."""
         t_env_in_phase = t_env - self.phase_start_t_env
 
-        # Phase 1 -> Phase 2 transition
+        # Phase 1 -> Phase 2 or Phase 3 transition
         if self.current_phase == 1 and t_env_in_phase >= getattr(self.args, 'phase1_steps', float('inf')):
-            self._transition_to_phase2(t_env)
+            if self.skip_mve:
+                # Ablation: skip phase 2, go directly to phase 3
+                self._transition_to_phase3_no_mve(t_env)
+            else:
+                self._transition_to_phase2(t_env)
 
         # Phase 2 -> Phase 3 transition
         elif self.current_phase == 2 and t_env_in_phase >= getattr(self.args, 'phase2_steps', float('inf')):
@@ -704,6 +819,61 @@ class MASIALearner:
         self.current_phase = 3
         self.phase_start_step = self.training_steps
         self.phase_start_t_env = t_env
+
+        # Log transition
+        self.logger.log_stat("training_phase", self.current_phase, t_env)
+
+    def _transition_to_phase3_no_mve(self, t_env):
+        """Transition from Phase 1 directly to Phase 3 (Ablation: skip MVE training).
+
+        Uses pure L1 norm + anchor loss instead of value-weighted sparsity.
+        """
+        self.logger.console_logger.info(f"\n{'='*60}")
+        self.logger.console_logger.info(f"PHASE TRANSITION: Phase 1 -> Phase 3 (skip MVE) at t_env {t_env}")
+        self.logger.console_logger.info(f"{'='*60}\n")
+
+        # Save Q_base (frozen Q-network for anchor loss)
+        if getattr(self.args, 'save_phase1_qbase', True):
+            self._save_q_base()
+
+        # Create frozen copies of MAC and mixer for anchor loss computation
+        mac_state = {k: v.clone().detach() for k, v in self.mac.state_dict().items()}
+        self.frozen_mac = type(self.mac)(self.mac.scheme, self.mac.groups, self.mac.args)
+        self.frozen_mac.load_state_dict(mac_state)
+        if self.args.use_cuda:
+            self.frozen_mac.cuda()
+
+        if self.mixer is not None:
+            mixer_state = {k: v.clone().detach() for k, v in self.mixer.state_dict().items()}
+            if self.args.mixer == "vdn":
+                self.frozen_mixer = type(self.mixer)()
+            else:
+                self.frozen_mixer = type(self.mixer)(self.args)
+            self.frozen_mixer.load_state_dict(mixer_state)
+            if self.args.use_cuda:
+                self.frozen_mixer.cuda()
+
+        # Freeze parameters
+        for param in self.frozen_mac.parameters():
+            param.requires_grad = False
+        if self.frozen_mixer is not None:
+            for param in self.frozen_mixer.parameters():
+                param.requires_grad = False
+
+        # Get Phase 3 hyperparameters (no MVE version)
+        self.l1_lambda = getattr(self.args, 'l1_lambda', 0.01)
+        self.anchor_beta = getattr(self.args, 'anchor_beta', 0.1)
+
+        self.logger.console_logger.info(f"Phase 3 (no MVE) hyperparameters: l1_lambda={self.l1_lambda}, "
+                                        f"anchor_beta={self.anchor_beta}")
+
+        # Update phase tracking
+        self.current_phase = 3
+        self.phase_start_step = self.training_steps
+        self.phase_start_t_env = t_env
+
+        # Disable message dropout for Phase 3
+        self.args.message_dropout_rate = 0.0
 
         # Log transition
         self.logger.log_stat("training_phase", self.current_phase, t_env)
