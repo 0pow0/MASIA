@@ -299,6 +299,7 @@ def run_sequential(args, logger):
         runner.t_env = timestep_to_load
 
         if args.evaluate or args.save_replay:
+            mac.agent.eval()  # Set model to eval mode for proper dropout behavior
             runner.log_train_stats_t = runner.t_env
             if args.test_encoder:
                 evaluate_encoder(args, runner, buffer, learner)
@@ -357,8 +358,10 @@ def run_sequential(args, logger):
 
             last_test_T = runner.t_env
             # normal test run
+            mac.agent.eval()  # Set model to eval mode for testing
             for _ in range(n_test_runs):
                 runner.run(test_mode=True, teacher_forcing=False)
+            mac.agent.train()  # Restore training mode
 
         if args.save_model and (
             runner.t_env - model_save_time >= args.save_model_interval
