@@ -78,16 +78,17 @@ class MASIAAgent(nn.Module):
         # inputs.shape: [batch_size*n_agents, input_shape]
         bs = inputs.shape[0] // self.args.n_agents
 
-        # decompose inputs
-        raw_inputs, extra_inputs = self._build_inputs(inputs)
-
         # Evaluation dropout (applied during test/eval mode for robustness testing)
+        # Must be applied before _build_inputs to avoid information leakage
         if not self.training and hasattr(self.args, 'eval_message_dropout_rate') and self.args.eval_message_dropout_rate > 0:
             inputs_reshaped = inputs.reshape(bs, self.args.n_agents, -1)
             dropout_mask = (th.rand(bs, self.args.n_agents) > self.args.eval_message_dropout_rate).float()
             dropout_mask = dropout_mask.unsqueeze(-1).to(inputs.device)
             inputs_reshaped = inputs_reshaped * dropout_mask
             inputs = inputs_reshaped.reshape(bs * self.args.n_agents, -1)
+
+        # decompose inputs
+        raw_inputs, extra_inputs = self._build_inputs(inputs)
 
         if "vae" in self.args.state_encoder:
             raise NotImplementedError
@@ -175,6 +176,15 @@ class MASIAAgent(nn.Module):
     def rl_forward(self, inputs, state_repr, hidden_state):
         # inputs.shape: [batch_size*n_agents, input_shape]
         bs = inputs.shape[0] // self.args.n_agents
+
+        # Evaluation dropout (applied during test/eval mode for robustness testing)
+        # Must be applied before _build_inputs to avoid information leakage
+        if not self.training and hasattr(self.args, 'eval_message_dropout_rate') and self.args.eval_message_dropout_rate > 0:
+            inputs_reshaped = inputs.reshape(bs, self.args.n_agents, -1)
+            dropout_mask = (th.rand(bs, self.args.n_agents) > self.args.eval_message_dropout_rate).float()
+            dropout_mask = dropout_mask.unsqueeze(-1).to(inputs.device)
+            inputs_reshaped = inputs_reshaped * dropout_mask
+            inputs = inputs_reshaped.reshape(bs * self.args.n_agents, -1)
 
         # decompose inputs
         raw_inputs, extra_inputs = self._build_inputs(inputs)
