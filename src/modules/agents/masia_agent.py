@@ -80,7 +80,10 @@ class MASIAAgent(nn.Module):
 
         # Evaluation dropout (applied during test/eval mode for robustness testing)
         # Must be applied before _build_inputs to avoid information leakage
+        print("RUI: forward")
+        print(f"{self.training} {hasattr(self.args, 'eval_message_dropout_rate')} {self.args.eval_message_dropout_rate > 0}")
         if not self.training and hasattr(self.args, 'eval_message_dropout_rate') and self.args.eval_message_dropout_rate > 0:
+            print("RUI: forward")
             inputs_reshaped = inputs.reshape(bs, self.args.n_agents, -1)
             dropout_mask = (th.rand(bs, self.args.n_agents) > self.args.eval_message_dropout_rate).float()
             dropout_mask = dropout_mask.unsqueeze(-1).to(inputs.device)
@@ -146,7 +149,9 @@ class MASIAAgent(nn.Module):
         bs = inputs.shape[0] // self.args.n_agents
 
         # Evaluation dropout (applied during test/eval mode for robustness testing)
+        print(f"{self.training} {hasattr(self.args, 'eval_message_dropout_rate')} {self.args.eval_message_dropout_rate > 0}")
         if not self.training and hasattr(self.args, 'eval_message_dropout_rate') and self.args.eval_message_dropout_rate > 0:
+            print("RUI: enc_forward")
             inputs_reshaped = inputs.reshape(bs, self.args.n_agents, -1)
             dropout_mask = (th.rand(bs, self.args.n_agents) > self.args.eval_message_dropout_rate).float()
             dropout_mask = dropout_mask.unsqueeze(-1).to(inputs.device)
@@ -179,7 +184,9 @@ class MASIAAgent(nn.Module):
 
         # Evaluation dropout (applied during test/eval mode for robustness testing)
         # Must be applied before _build_inputs to avoid information leakage
+        print(f"{self.training} {hasattr(self.args, 'eval_message_dropout_rate')} {self.args.eval_message_dropout_rate > 0}")
         if not self.training and hasattr(self.args, 'eval_message_dropout_rate') and self.args.eval_message_dropout_rate > 0:
+            print("RUI: rl_forward")
             inputs_reshaped = inputs.reshape(bs, self.args.n_agents, -1)
             dropout_mask = (th.rand(bs, self.args.n_agents) > self.args.eval_message_dropout_rate).float()
             dropout_mask = dropout_mask.unsqueeze(-1).to(inputs.device)
