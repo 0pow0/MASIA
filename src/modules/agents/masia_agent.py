@@ -8,6 +8,15 @@ import copy
 from modules.state_encoders import REGISTRY as state_enc_REGISTRY
 from types import SimpleNamespace as SN
 
+def print_tensor_stats(name, tensor):
+    print(f"--- Stats for {name} ---")
+    print(f"Shape: {tensor.shape}")
+    print(f"Type:  {tensor.dtype}")
+    print(f"Min:   {tensor.min().item():.4f}")
+    print(f"Max:   {tensor.max().item():.4f}")
+    print(f"Mean:  {tensor.mean().item():.4f}")
+    print(f"Std:   {tensor.std().item():.4f}")
+    print("-----------------------")
 
 class MASIAAgent(nn.Module):
     """
@@ -87,6 +96,7 @@ class MASIAAgent(nn.Module):
             inputs_reshaped = inputs.reshape(bs, self.args.n_agents, -1)
             dropout_mask = (th.rand(bs, self.args.n_agents) > self.args.eval_message_dropout_rate).float()
             dropout_mask = dropout_mask.unsqueeze(-1).to(inputs.device)
+            print_tensor_stats(dropout_mask)
             inputs_reshaped = inputs_reshaped * dropout_mask
             inputs = inputs_reshaped.reshape(bs * self.args.n_agents, -1)
 
@@ -155,6 +165,7 @@ class MASIAAgent(nn.Module):
             inputs_reshaped = inputs.reshape(bs, self.args.n_agents, -1)
             dropout_mask = (th.rand(bs, self.args.n_agents) > self.args.eval_message_dropout_rate).float()
             dropout_mask = dropout_mask.unsqueeze(-1).to(inputs.device)
+            print_tensor_stats(dropout_mask)
             inputs_reshaped = inputs_reshaped * dropout_mask
             inputs = inputs_reshaped.reshape(bs * self.args.n_agents, -1)
 
@@ -190,6 +201,7 @@ class MASIAAgent(nn.Module):
             inputs_reshaped = inputs.reshape(bs, self.args.n_agents, -1)
             dropout_mask = (th.rand(bs, self.args.n_agents) > self.args.eval_message_dropout_rate).float()
             dropout_mask = dropout_mask.unsqueeze(-1).to(inputs.device)
+            print_tensor_stats(dropout_mask)
             inputs_reshaped = inputs_reshaped * dropout_mask
             inputs = inputs_reshaped.reshape(bs * self.args.n_agents, -1)
 
