@@ -146,9 +146,7 @@ class MASIAAgent(nn.Module):
             embedded_inputs = embedded_inputs_reshaped.reshape(bs * self.args.n_agents, -1)
 
         # Evaluation dropout (applied during test/eval mode for robustness testing)
-        print(self.training, hasattr(self.args, 'eval_message_dropout_rate'), self.args.eval_message_dropout_rate > 0)
         if not self.training and hasattr(self.args, 'eval_message_dropout_rate') and self.args.eval_message_dropout_rate > 0:
-            print("RUI")
             embedded_inputs_reshaped = embedded_inputs.reshape(bs, self.args.n_agents, -1)
             dropout_mask = (th.rand(bs, self.args.n_agents) > self.args.eval_message_dropout_rate).float()
             dropout_mask = dropout_mask.unsqueeze(-1).to(embedded_inputs.device)
@@ -236,7 +234,6 @@ class MASIAAgent(nn.Module):
         comm_active = (embedded_inputs.abs() > comm_threshold).float()
         self._comm_l0_norm = comm_active.mean()
 
-        print(self.training, hasattr(self.args, 'eval_message_dropout_rate'), self.args.eval_message_dropout_rate > 0)
         # Step 2a: Apply explicit silence mask (for MVE training)
         if silence_mask is not None:
             # silence_mask: [bs, n_agents] where 1=silence, 0=keep
@@ -258,7 +255,6 @@ class MASIAAgent(nn.Module):
         # Step 2c: Evaluation dropout (applied during test/eval mode for robustness testing)
         # print(self.training, hasattr(self.args, 'eval_message_dropout_rate'), self.args.eval_message_dropout_rate > 0)
         elif not self.training and hasattr(self.args, 'eval_message_dropout_rate') and self.args.eval_message_dropout_rate > 0:
-            print("RUI")
             embedded_inputs_reshaped = embedded_inputs.reshape(bs, self.args.n_agents, -1)
             dropout_mask = (th.rand(bs, self.args.n_agents) > self.args.eval_message_dropout_rate).float()
             dropout_mask = dropout_mask.unsqueeze(-1).to(embedded_inputs.device)
