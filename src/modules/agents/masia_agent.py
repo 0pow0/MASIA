@@ -114,10 +114,8 @@ class MASIAAgent(nn.Module):
         # inputs.shape: [batch_size*n_agents, input_shape]
         bs = inputs.shape[0] // self.args.n_agents
 
-        # decompose inputs
-        raw_inputs, extra_inputs = self._build_inputs(inputs)
-
-        # Step 1: Embed observations (this creates a learnable transformation for unlearning)
+        # ==================== SENDER SIDE ====================
+        # Step 1: Embed observations (sender creates message)
         embedded_inputs = self.obs_embed(inputs)  # [bs*n_agents, input_shape]
 
         # Compute L0-norm of embedded_inputs BEFORE any dropout/masking (communication rate metric)
@@ -126,26 +124,16 @@ class MASIAAgent(nn.Module):
         comm_active = (embedded_inputs.abs() > comm_threshold).float()
         self._comm_l0_norm = comm_active.mean()
 
-        # Step 2: Apply per-agent message dropout BEFORE encoder (critical for unlearning)
-        # This ensures dropped messages never reach the encoder
+        # ==================== MESSAGE DROPOUT ====================
+        # Step 2: Apply per-agent message dropout (training mode)
         if self.training and hasattr(self.args, 'message_dropout_rate') and self.args.message_dropout_rate > 0:
-            # Reshape to separate agents: [bs, n_agents, input_shape]
             embedded_inputs_reshaped = embedded_inputs.reshape(bs, self.args.n_agents, -1)
-
-            # Create dropout mask for each agent: [bs, n_agents]
-            # dropout_mask=1 means keep the message, 0 means drop it
             dropout_mask = (th.rand(bs, self.args.n_agents) > self.args.message_dropout_rate).float()
-
-            # Expand mask to cover input dimensions: [bs, n_agents, 1]
             dropout_mask = dropout_mask.unsqueeze(-1).to(embedded_inputs.device)
-
-            # Apply dropout: dropped messages become zero vectors
             embedded_inputs_reshaped = embedded_inputs_reshaped * dropout_mask
-
-            # Flatten back: [bs*n_agents, input_shape]
             embedded_inputs = embedded_inputs_reshaped.reshape(bs * self.args.n_agents, -1)
 
-        # Evaluation dropout (applied during test/eval mode for robustness testing)
+        # Step 2b: Evaluation dropout (applied during test/eval mode for robustness testing)
         if not self.training and hasattr(self.args, 'eval_message_dropout_rate') and self.args.eval_message_dropout_rate > 0:
             embedded_inputs_reshaped = embedded_inputs.reshape(bs, self.args.n_agents, -1)
             dropout_mask = (th.rand(bs, self.args.n_agents) > self.args.eval_message_dropout_rate).float()
@@ -153,7 +141,11 @@ class MASIAAgent(nn.Module):
             embedded_inputs_reshaped = embedded_inputs_reshaped * dropout_mask
             embedded_inputs = embedded_inputs_reshaped.reshape(bs * self.args.n_agents, -1)
 
-        # Step 3: Pass embedded (and possibly dropped) observations to encoder
+        # ==================== RECEIVER SIDE ====================
+        # Step 3: Decompose embedded inputs (receiver processes received messages)
+        raw_inputs, extra_inputs = self._build_inputs(embedded_inputs)
+
+        # Step 4: Pass embedded (and possibly dropped) observations to encoder
         if "vae" in self.args.state_encoder:
             raise NotImplementedError
         elif "ae" in self.args.state_encoder:
@@ -178,18 +170,16 @@ class MASIAAgent(nn.Module):
                 raise ValueError("Don't get here!!!")
         else:
             raise ValueError("Unknown encoder!!!")
-        
-        # through gate
-        weighted = F.sigmoid(self.gate(inputs)) # [bs*n_agents, state_repre_dim]
+
+        # Step 5: Gate (uses embedded inputs after dropout)
+        weighted = F.sigmoid(self.gate(embedded_inputs)) # [bs*n_agents, state_repre_dim]
         if self.args.noise_env and self.args.noise_type == 1:
             repeated_z = z
         else:
             repeated_z = z.unsqueeze(1).repeat(1, self.args.n_agents, 1).reshape(bs*self.args.n_agents, -1) # [bs*n_agents, state_repre_dim]
         weighted_z = weighted * repeated_z
 
-        # Note: Message dropout now happens BEFORE the encoder (see Step 2 above)
-        # This ensures the encoder never sees dropped messages, which is critical for unlearning
-
+        # Step 6: Observation embedding for policy (uses raw_inputs from embedded)
         ob_embed = self.ob_fc(raw_inputs)   # [bs*n_agents, ob_embed_dim]
 
         if self.args.concat_obs:
@@ -197,7 +187,7 @@ class MASIAAgent(nn.Module):
         else:
             action_inputs = th.cat([weighted_z, extra_inputs], dim=-1)
 
-        # go through remaining networks
+        # Step 7: Go through remaining networks
         x = F.relu(self.fc1(action_inputs))
         h_in = hidden_state.reshape(-1, self.args.hidden_dim)
         if self.args.use_rnn:
@@ -297,17 +287,38 @@ class MASIAAgent(nn.Module):
         # inputs.shape: [batch_size*n_agents, input_shape]
         bs = inputs.shape[0] // self.args.n_agents
 
-        # decompose inputs
-        raw_inputs, extra_inputs = self._build_inputs(inputs)
+        # ==================== SENDER SIDE ====================
+        # Step 1: Embed observations (sender creates message)
+        embedded_inputs = self.obs_embed(inputs)  # [bs*n_agents, input_shape]
 
-        # through gate
-        weighted = F.sigmoid(self.gate(inputs)) # [bs*n_agents, state_repre_dim]
+        # ==================== MESSAGE DROPOUT ====================
+        # Step 2: Apply per-agent message dropout (training mode)
+        if self.training and hasattr(self.args, 'message_dropout_rate') and self.args.message_dropout_rate > 0:
+            embedded_inputs_reshaped = embedded_inputs.reshape(bs, self.args.n_agents, -1)
+            dropout_mask = (th.rand(bs, self.args.n_agents) > self.args.message_dropout_rate).float()
+            dropout_mask = dropout_mask.unsqueeze(-1).to(embedded_inputs.device)
+            embedded_inputs_reshaped = embedded_inputs_reshaped * dropout_mask
+            embedded_inputs = embedded_inputs_reshaped.reshape(bs * self.args.n_agents, -1)
+
+        # Step 2b: Evaluation dropout (applied during test/eval mode for robustness testing)
+        if not self.training and hasattr(self.args, 'eval_message_dropout_rate') and self.args.eval_message_dropout_rate > 0:
+            embedded_inputs_reshaped = embedded_inputs.reshape(bs, self.args.n_agents, -1)
+            dropout_mask = (th.rand(bs, self.args.n_agents) > self.args.eval_message_dropout_rate).float()
+            dropout_mask = dropout_mask.unsqueeze(-1).to(embedded_inputs.device)
+            embedded_inputs_reshaped = embedded_inputs_reshaped * dropout_mask
+            embedded_inputs = embedded_inputs_reshaped.reshape(bs * self.args.n_agents, -1)
+
+        # ==================== RECEIVER SIDE ====================
+        # Step 3: Decompose embedded inputs (receiver processes received messages)
+        raw_inputs, extra_inputs = self._build_inputs(embedded_inputs)
+
+        # Step 4: Gate (uses embedded inputs after dropout)
+        # Note: state_repr was computed separately (in enc_forward) with its own dropout
+        weighted = F.sigmoid(self.gate(embedded_inputs)) # [bs*n_agents, state_repre_dim]
         repeated_z = state_repr.unsqueeze(1).repeat(1, self.args.n_agents, 1).reshape(bs*self.args.n_agents, -1) # [bs*n_agents, state_repre_dim]
         weighted_z = weighted * repeated_z
 
-        # Note: Message dropout is applied before encoding (in enc_forward or forward)
-        # so state_repr already reflects the dropped messages
-
+        # Step 5: Observation embedding for policy (uses raw_inputs from embedded)
         ob_embed = self.ob_fc(raw_inputs)   # [bs*n_agents, ob_embed_dim]
 
         if self.args.concat_obs:
@@ -315,7 +326,7 @@ class MASIAAgent(nn.Module):
         else:
             action_inputs = th.cat([weighted_z, extra_inputs], dim=-1)
 
-        # go through remaining networks
+        # Step 6: Go through remaining networks
         x = F.relu(self.fc1(action_inputs))
         h_in = hidden_state.reshape(-1, self.args.hidden_dim)
         if self.args.use_rnn:
