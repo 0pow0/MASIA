@@ -8,8 +8,7 @@ import copy
 from modules.state_encoders import REGISTRY as state_enc_REGISTRY
 from types import SimpleNamespace as SN
 
-def print_tensor_stats(name, tensor):
-    print(f"--- Stats for {name} ---")
+def print_tensor_stats(tensor):
     print(f"Shape: {tensor.shape}")
     print(f"Type:  {tensor.dtype}")
     print(f"Min:   {tensor.min().item():.4f}")
