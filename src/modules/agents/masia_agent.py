@@ -8,15 +8,6 @@ import copy
 from modules.state_encoders import REGISTRY as state_enc_REGISTRY
 from types import SimpleNamespace as SN
 
-def print_tensor_stats(tensor):
-    print(f"Shape: {tensor.shape}")
-    print(f"Type:  {tensor.dtype}")
-    print(f"Min:   {tensor.min().item():.4f}")
-    print(f"Max:   {tensor.max().item():.4f}")
-    print(f"Mean:  {tensor.mean().item():.4f}")
-    print(f"Std:   {tensor.std().item():.4f}")
-    print("-----------------------")
-
 class MASIAAgent(nn.Module):
     """
         VAE State Estimation Agent
@@ -88,14 +79,10 @@ class MASIAAgent(nn.Module):
 
         # Evaluation dropout (applied during test/eval mode for robustness testing)
         # Must be applied before _build_inputs to avoid information leakage
-        print("RUI: forward")
-        print(f"{self.training} {hasattr(self.args, 'eval_message_dropout_rate')} {self.args.eval_message_dropout_rate > 0}")
         if not self.training and hasattr(self.args, 'eval_message_dropout_rate') and self.args.eval_message_dropout_rate > 0:
-            print("RUI: forward")
             inputs_reshaped = inputs.reshape(bs, self.args.n_agents, -1)
             dropout_mask = (th.rand(bs, self.args.n_agents) > self.args.eval_message_dropout_rate).float()
             dropout_mask = dropout_mask.unsqueeze(-1).to(inputs.device)
-            print_tensor_stats(dropout_mask)
             inputs_reshaped = inputs_reshaped * dropout_mask
             inputs = inputs_reshaped.reshape(bs * self.args.n_agents, -1)
 
@@ -158,13 +145,10 @@ class MASIAAgent(nn.Module):
         bs = inputs.shape[0] // self.args.n_agents
 
         # Evaluation dropout (applied during test/eval mode for robustness testing)
-        print(f"{self.training} {hasattr(self.args, 'eval_message_dropout_rate')} {self.args.eval_message_dropout_rate > 0}")
         if not self.training and hasattr(self.args, 'eval_message_dropout_rate') and self.args.eval_message_dropout_rate > 0:
-            print("RUI: enc_forward")
             inputs_reshaped = inputs.reshape(bs, self.args.n_agents, -1)
             dropout_mask = (th.rand(bs, self.args.n_agents) > self.args.eval_message_dropout_rate).float()
             dropout_mask = dropout_mask.unsqueeze(-1).to(inputs.device)
-            print_tensor_stats(dropout_mask)
             inputs_reshaped = inputs_reshaped * dropout_mask
             inputs = inputs_reshaped.reshape(bs * self.args.n_agents, -1)
 
@@ -194,13 +178,10 @@ class MASIAAgent(nn.Module):
 
         # Evaluation dropout (applied during test/eval mode for robustness testing)
         # Must be applied before _build_inputs to avoid information leakage
-        print(f"{self.training} {hasattr(self.args, 'eval_message_dropout_rate')} {self.args.eval_message_dropout_rate > 0}")
         if not self.training and hasattr(self.args, 'eval_message_dropout_rate') and self.args.eval_message_dropout_rate > 0:
-            print("RUI: rl_forward")
             inputs_reshaped = inputs.reshape(bs, self.args.n_agents, -1)
             dropout_mask = (th.rand(bs, self.args.n_agents) > self.args.eval_message_dropout_rate).float()
             dropout_mask = dropout_mask.unsqueeze(-1).to(inputs.device)
-            print_tensor_stats(dropout_mask)
             inputs_reshaped = inputs_reshaped * dropout_mask
             inputs = inputs_reshaped.reshape(bs * self.args.n_agents, -1)
 
