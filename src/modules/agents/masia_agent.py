@@ -236,7 +236,7 @@ class MASIAAgent(nn.Module):
         comm_active = (embedded_inputs.abs() > comm_threshold).float()
         self._comm_l0_norm = comm_active.mean()
 
-        print(self.training), hasattr(self.args, 'eval_message_dropout_rate'), self.args.eval_message_dropout_rate > 0)
+        print(self.training, hasattr(self.args, 'eval_message_dropout_rate'), self.args.eval_message_dropout_rate > 0)
         # Step 2a: Apply explicit silence mask (for MVE training)
         if silence_mask is not None:
             # silence_mask: [bs, n_agents] where 1=silence, 0=keep
