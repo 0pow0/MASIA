@@ -23,9 +23,14 @@ class MASIAAgent(nn.Module):
         # This layer transforms raw observations before they reach the encoder
         self.obs_embed = nn.Linear(input_shape, input_shape)
 
+        # Check if this is a predator-prey environment
+        self.is_pp_env = getattr(args, 'env', '') == 'pp'
+
         # define state estimator (observation integration function)
         state_dim = int(np.prod(args.state_shape))
-        self.encoder = state_enc_REGISTRY[args.state_encoder](input_shape=input_shape, output_shape=state_dim, n_agents=args.n_agents, latent_dim=args.state_repre_dim, args=args)
+        # For predator-prey env, concat state embed with raw state before encoding
+        encoder_input_shape = input_shape * 2 if self.is_pp_env else input_shape
+        self.encoder = state_enc_REGISTRY[args.state_encoder](input_shape=encoder_input_shape, output_shape=state_dim, n_agents=args.n_agents, latent_dim=args.state_repre_dim, args=args)
 
         # get some dimension information
         self.latent_dim = args.state_repre_dim * args.n_agents
@@ -154,26 +159,32 @@ class MASIAAgent(nn.Module):
             embedded_inputs = embedded_inputs_reshaped.reshape(bs * self.args.n_agents, -1)
 
         # Step 3: Pass embedded (and possibly dropped) observations to encoder
+        # For predator-prey env, concat state embed with raw state before encoding
+        if self.is_pp_env:
+            encoder_input = th.cat([embedded_inputs, inputs], dim=-1)
+        else:
+            encoder_input = embedded_inputs
+
         if "vae" in self.args.state_encoder:
             raise NotImplementedError
         elif "ae" in self.args.state_encoder:
             # z.shape: [batch_size, state_repr_dim]
             if self.args.noise_env and self.args.noise_type == 0:
                 # TODO: not exactly right !!!
-                noise = th.randn(*embedded_inputs.shape)
-                embedded_inputs += noise.to(embedded_inputs.device)
-                z, encoder_h = self.encoder.encode(embedded_inputs, encoder_hidden_state)
+                noise = th.randn(*encoder_input.shape)
+                encoder_input = encoder_input + noise.to(encoder_input.device)
+                z, encoder_h = self.encoder.encode(encoder_input, encoder_hidden_state)
             elif self.args.noise_env and self.args.noise_type == 1:
-                # embedded_inputs.shape: [bs, n_agents, n_agents, input_dim]
-                embedded_inputs = embedded_inputs.reshape(bs, self.args.n_agents, embedded_inputs.shape[-1]).unsqueeze(1).repeat(1, self.args.n_agents, 1, 1)
-                noise = th.randn(bs, self.args.n_agents, self.args.n_agents, embedded_inputs.shape[-1])
+                # encoder_input.shape: [bs, n_agents, n_agents, input_dim]
+                encoder_input = encoder_input.reshape(bs, self.args.n_agents, encoder_input.shape[-1]).unsqueeze(1).repeat(1, self.args.n_agents, 1, 1)
+                noise = th.randn(bs, self.args.n_agents, self.args.n_agents, encoder_input.shape[-1])
                 mask = (1 - th.eye(self.args.n_agents, self.args.n_agents)).unsqueeze(0).repeat(bs, 1, 1).unsqueeze(-1)
-                embedded_inputs = (embedded_inputs + (noise * mask).to(embedded_inputs.device)).flatten(0, 2)
+                encoder_input = (encoder_input + (noise * mask).to(encoder_input.device)).flatten(0, 2)
                 # z.shape: [bs * n_agents, z_dim]
                 # TODO: fix this bug
-                z, encoder_h = self.encoder.encode(embedded_inputs, encoder_hidden_state)
+                z, encoder_h = self.encoder.encode(encoder_input, encoder_hidden_state)
             elif not self.args.noise_env:
-                z, encoder_h = self.encoder.encode(embedded_inputs, encoder_hidden_state)
+                z, encoder_h = self.encoder.encode(encoder_input, encoder_hidden_state)
             else:
                 raise ValueError("Don't get here!!!")
         else:
@@ -262,13 +273,19 @@ class MASIAAgent(nn.Module):
             embedded_inputs = embedded_inputs_reshaped.reshape(bs * self.args.n_agents, -1)
 
         # Step 3: Encode
+        # For predator-prey env, concat state embed with raw state before encoding
+        if self.is_pp_env:
+            encoder_input = th.cat([embedded_inputs, inputs], dim=-1)
+        else:
+            encoder_input = embedded_inputs
+
         if "vae" in self.args.state_encoder:
             raise NotImplementedError
         elif "ae" in self.args.state_encoder:
             if self.args.noise_env:
-                noise = th.randn(bs*self.args.n_agents, embedded_inputs.shape[-1])
-                embedded_inputs += noise.to(embedded_inputs.device)
-            z, encoder_h = self.encoder.encode(embedded_inputs, encoder_hidden_state)
+                noise = th.randn(bs*self.args.n_agents, encoder_input.shape[-1])
+                encoder_input = encoder_input + noise.to(encoder_input.device)
+            z, encoder_h = self.encoder.encode(encoder_input, encoder_hidden_state)
         else:
             raise ValueError("Unknown encoder!!!")
 
@@ -289,10 +306,16 @@ class MASIAAgent(nn.Module):
             embedded_inputs_reshaped = embedded_inputs_reshaped * dropout_mask
             embedded_inputs = embedded_inputs_reshaped.reshape(bs * self.args.n_agents, -1)
 
+        # For predator-prey env, concat state embed with raw state before encoding
+        if self.is_pp_env:
+            encoder_input = th.cat([embedded_inputs, inputs], dim=-1)
+        else:
+            encoder_input = embedded_inputs
+
         if self.args.noise_env:
-            noise = th.randn(bs*self.args.n_agents, embedded_inputs.shape[-1])
-            embedded_inputs += noise.to(embedded_inputs.device)
-        return self.encoder(embedded_inputs, encoder_hidden_state)
+            noise = th.randn(bs*self.args.n_agents, encoder_input.shape[-1])
+            encoder_input = encoder_input + noise.to(encoder_input.device)
+        return self.encoder(encoder_input, encoder_hidden_state)
     
     def rl_forward(self, inputs, state_repr, hidden_state):
         # inputs.shape: [batch_size*n_agents, input_shape]
@@ -345,14 +368,20 @@ class MASIAAgent(nn.Module):
             embedded_inputs_reshaped = embedded_inputs_reshaped * dropout_mask
             embedded_inputs = embedded_inputs_reshaped.reshape(bs * self.args.n_agents, -1)
 
+        # For predator-prey env, concat state embed with raw state before encoding
+        if self.is_pp_env:
+            encoder_input = th.cat([embedded_inputs, inputs], dim=-1)
+        else:
+            encoder_input = embedded_inputs
+
         if "vae" in self.args.state_encoder:
             raise NotImplementedError
         elif "ae" in self.args.state_encoder:
             if self.args.noise_env:
-                noise = th.randn(bs*self.args.n_agents, embedded_inputs.shape[-1])
-                embedded_inputs += noise.to(embedded_inputs.device)
+                noise = th.randn(bs*self.args.n_agents, encoder_input.shape[-1])
+                encoder_input = encoder_input + noise.to(encoder_input.device)
             # z.shape: [batch_size, self.latent_dim]
-            z, encoder_h = self.encoder.encode(embedded_inputs, encoder_hidden_state)
+            z, encoder_h = self.encoder.encode(encoder_input, encoder_hidden_state)
         else:
             raise ValueError("Unknown encoder!!!")
 
@@ -386,14 +415,20 @@ class MASIAAgent(nn.Module):
             embedded_inputs_reshaped = embedded_inputs_reshaped * dropout_mask
             embedded_inputs = embedded_inputs_reshaped.reshape(bs * self.args.n_agents, -1)
 
+        # For predator-prey env, concat state embed with raw state before encoding
+        if self.is_pp_env:
+            encoder_input = th.cat([embedded_inputs, inputs], dim=-1)
+        else:
+            encoder_input = embedded_inputs
+
         if "vae" in self.args.state_encoder:
             raise NotImplementedError
         elif "ae" in self.args.state_encoder:
             if self.args.noise_env:
-                noise = th.randn(*embedded_inputs.shape)
-                embedded_inputs += noise.to(embedded_inputs.device)
+                noise = th.randn(*encoder_input.shape)
+                encoder_input = encoder_input + noise.to(encoder_input.device)
             # z.shape: [batch_size, n_agents, state_repre_dim]
-            z, encoder_h = self.target_encoder.encode(embedded_inputs, encoder_hidden_state)
+            z, encoder_h = self.target_encoder.encode(encoder_input, encoder_hidden_state)
         else:
             raise ValueError("Unknown encoder!!!")
 
