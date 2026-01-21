@@ -1,6 +1,7 @@
 from functools import partial
 import pretrained
 from smac.env import MultiAgentEnv, StarCraft2Env
+from smacv2.env.starcraft2.wrapper import StarCraftCapabilityEnvWrapper
 import sys
 import os
 import gym
@@ -22,6 +23,74 @@ from .traffic_junction import Traffic_JunctionEnv
 from .predator_prey import PredatorPreyEnv
 REGISTRY["traffic_junction"] = partial(env_fn, env=Traffic_JunctionEnv)
 REGISTRY["sc2"] = partial(env_fn, env=StarCraft2Env)
+
+
+class SMACv2Wrapper(MultiAgentEnv):
+    """Wrapper for SMACv2 environment with procedurally generated scenarios."""
+
+    def __init__(self, capability_config, map_name="10gen_terran", **kwargs):
+        self._env = StarCraftCapabilityEnvWrapper(
+            capability_config=capability_config,
+            map_name=map_name,
+            **kwargs
+        )
+        self.n_agents = self._env.n_agents
+        self.episode_limit = self._env.episode_limit
+
+    def step(self, actions):
+        reward, terminated, info = self._env.step(actions)
+        return reward, terminated, info
+
+    def get_obs(self):
+        return self._env.get_obs()
+
+    def get_obs_agent(self, agent_id):
+        return self._env.get_obs_agent(agent_id)
+
+    def get_obs_size(self):
+        return self._env.get_obs_size()
+
+    def get_state(self):
+        return self._env.get_state()
+
+    def get_state_size(self):
+        return self._env.get_state_size()
+
+    def get_avail_actions(self):
+        return self._env.get_avail_actions()
+
+    def get_avail_agent_actions(self, agent_id):
+        return self._env.get_avail_agent_actions(agent_id)
+
+    def get_total_actions(self):
+        return self._env.get_total_actions()
+
+    def reset(self):
+        return self._env.reset()
+
+    def close(self):
+        self._env.close()
+
+    def save_replay(self):
+        self._env.save_replay()
+
+    def get_stats(self):
+        return self._env.get_stats()
+
+    def get_env_info(self):
+        env_info = self._env.get_env_info()
+        # Add unit_dim for compatibility with QPLEX mixer
+        # Compute based on ally state attribute count from SMACv2
+        if hasattr(self._env.env, 'ally_state_attr_names'):
+            self.unit_dim = len(self._env.env.ally_state_attr_names)
+        else:
+            # Fallback: estimate from state size
+            self.unit_dim = self.get_state_size() // self.n_agents
+        env_info["unit_dim"] = self.unit_dim
+        return env_info
+
+
+REGISTRY["sc2v2"] = partial(env_fn, env=SMACv2Wrapper)
 REGISTRY["hallway"] = partial(env_fn, env=Join1Env)
 REGISTRY["hallway_group"] = partial(env_fn, env=JoinNEnv)
 REGISTRY["pp"] = partial(env_fn, env=PredatorPreyEnv)

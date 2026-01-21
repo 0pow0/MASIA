@@ -903,5 +903,12 @@ def get_smac_map_registry():
     return map_param_registry
 
 
+# Maps that conflict with SMACv2 - skip registration to avoid pysc2 DuplicateMapError
+_smacv2_maps = {"3m", "8m", "25m", "5m_vs_6m", "8m_vs_9m", "10m_vs_11m", "27m_vs_30m",
+                "MMM", "MMM2", "2s3z", "3s5z", "3s5z_vs_3s6z", "3s_vs_3z", "3s_vs_4z",
+                "3s_vs_5z", "1c3s5z", "2m_vs_1z", "corridor", "6h_vs_8z", "2s_vs_1sc",
+                "so_many_baneling", "bane_vs_bane", "2c_vs_64zg"}
+
 for name in map_param_registry.keys():
-    globals()[name] = type(name, (SMACMap,), dict(filename=name))
+    if name not in _smacv2_maps:
+        globals()[name] = type(name, (SMACMap,), dict(filename=name))
