@@ -1,0 +1,25 @@
+env: sc2v2
+
+env_args:
+  map_name: "10gen_zerg"
+  capability_config:
+    n_units: 10
+    n_enemies: 10
+    team_gen:
+      dist_type: "weighted_teams"
+      unit_types: ["zergling", "hydralisk", "baneling"]
+      weights: [0.45, 0.45, 0.1]
+      observe: true
+    start_positions:
+      dist_type: "surrounded_and_reflect"
+      p: 0.5
+      map_x: 32
+      map_y: 32
+
+test_greedy: True
+test_nepisode: 100
+test_interval: 50000
+log_interval: 10000
+runner_log_interval: 10000
+learner_log_interval: 10000
+t_max: 2050000
