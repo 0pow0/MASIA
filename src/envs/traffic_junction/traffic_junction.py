@@ -41,10 +41,11 @@ class Traffic_JunctionEnv(MultiAgentEnv):
                  curr_start: float,
                  curr_end: float,
                  difficulty: str,
-                 seed: int, 
+                 seed: int,
                  vocab_type: str,
                  map_name: str=' ',
                  time_limit=50,
+                 **kwargs,
                  ):
 
         parser_env = argparse.ArgumentParser('Example GCCNet environment random agent')
@@ -107,7 +108,11 @@ class Traffic_JunctionEnv(MultiAgentEnv):
     def step(self, actions):
         """ Returns reward, terminated, info """
         #print(actions)
-        obs, rewards, dones, _ = self.env.step(actions.cpu().numpy())
+        if isinstance(actions, np.ndarray):
+            actions_np = actions
+        else:
+            actions_np = actions.cpu().numpy()
+        obs, rewards, dones, _ = self.env.step(actions_np)
         self.obs = self._flatten_obs(obs)
         
         if self.display:
